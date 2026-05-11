@@ -7,7 +7,6 @@ import shutil
 import urllib.parse
 from pathlib import Path
 
-import gdown
 import requests
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -18,9 +17,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
-API_ID       = int(os.environ.get("TELEGRAM_API_ID", "0"))
-API_HASH     = os.environ.get("TELEGRAM_API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+API_ID    = int(os.environ.get("TELEGRAM_API_ID", "0"))
+API_HASH  = os.environ.get("TELEGRAM_API_HASH", "")
 
 GDRIVE_PATTERNS = [
     r"https://drive\.google\.com/file/d/([a-zA-Z0-9_-]+)",
@@ -33,7 +32,10 @@ FOLDER_PATTERNS = [
     r"https://drive\.google\.com/drive/folders/([a-zA-Z0-9_-]+)",
 ]
 
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB — Pyrogram/MTProto limit
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
+
+GDRIVE_DOWNLOAD_URL = "https://drive.google.com/uc"
+GDRIVE_API_URL      = "https://www.googleapis.com/drive/v3/files"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -48,21 +50,10 @@ def extract_file_id(url):
     return None, "unknown"
 
 
-def get_real_filename(file_id):
-    try:
-        url  = f"https://drive.google.com/uc?id={file_id}&export=download"
-        resp = requests.head(url, allow_redirects=True, timeout=10)
-        cd   = resp.headers.get("Content-Disposition", "")
-        m    = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\n]+)', cd, re.IGNORECASE)
-        if m:
-            name = urllib.parse.unquote(m.group(1).strip().strip('"\''))
-            if name: return name
-        ct  = resp.headers.get("Content-Type", "")
-        ext = content_type_to_ext(ct)
-        if ext: return f"file{ext}"
-    except Exception as e:
-        logger.warning(f"Filename fetch failed: {e}")
-    return None
+def human_size(b):
+    if b < 1024**2:  return f"{b/1024:.1f} KB"
+    if b < 1024**3:  return f"{b/1024**2:.1f} MB"
+    return f"{b/1024**3:.2f} GB"
 
 
 def content_type_to_ext(ct):
@@ -74,14 +65,16 @@ def content_type_to_ext(ct):
         "video/x-msvideo": ".avi", "video/webm": ".webm",
         "audio/mpeg": ".mp3", "audio/ogg": ".ogg", "audio/wav": ".wav", "audio/flac": ".flac",
         "application/zip": ".zip", "application/x-rar-compressed": ".rar",
-        "application/x-7z-compressed": ".7z", "application/x-tar": ".tar", "application/gzip": ".gz",
+        "application/x-7z-compressed": ".7z", "application/x-tar": ".tar",
+        "application/gzip": ".gz",
         "application/vnd.ms-excel": ".xls",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
         "application/msword": ".doc",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
         "application/vnd.ms-powerpoint": ".ppt",
         "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
-        "text/plain": ".txt", "text/csv": ".csv", "application/json": ".json", "text/html": ".html",
+        "text/plain": ".txt", "text/csv": ".csv",
+        "application/json": ".json", "text/html": ".html",
     }.get(ct, "")
 
 
@@ -101,14 +94,7 @@ def sniff_extension(filepath):
     return ""
 
 
-def human_size(b):
-    if b < 1024**2:    return f"{b/1024:.1f} KB"
-    if b < 1024**3:    return f"{b/1024**2:.1f} MB"
-    return f"{b/1024**3:.2f} GB"
-
-
 def fix_filename(fp: Path) -> Path:
-    """Rename file if it has no extension."""
     if "." not in fp.name:
         ext = sniff_extension(str(fp))
         if ext:
@@ -118,7 +104,124 @@ def fix_filename(fp: Path) -> Path:
     return fp
 
 
-# ── Bot logic ─────────────────────────────────────────────────────────────────
+# ── Google Drive Downloader (no gdown) ───────────────────────────────────────
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0.0.0 Safari/537.36"
+})
+
+
+def _get_confirm_token(response):
+    # New-style: look for download_warning cookie
+    for k, v in response.cookies.items():
+        if k.startswith("download_warning"):
+            return v
+    # Also check for form-based confirm token in HTML
+    m = re.search(r'confirm=([0-9A-Za-z_\-]+)', response.text)
+    if m:
+        return m.group(1)
+    # New 2024 style: &uuid= token
+    m = re.search(r'"downloadUrl":"([^"]+)"', response.text)
+    if m:
+        return ("__direct__", urllib.parse.unquote(m.group(1).replace("\\u003d", "=").replace("\\u0026", "&")))
+    return None
+
+
+def download_gdrive_file(file_id: str, dest_dir: str) -> str:
+    """
+    Download a Google Drive file robustly without gdown.
+    Returns the path to the downloaded file.
+    """
+    url = f"{GDRIVE_DOWNLOAD_URL}?id={file_id}&export=download&confirm=t&uuid=1"
+
+    # First request
+    resp = SESSION.get(url, stream=True, timeout=30)
+
+    filename = None
+    # Try to get filename from Content-Disposition
+    cd = resp.headers.get("Content-Disposition", "")
+    m  = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\n]+)', cd, re.IGNORECASE)
+    if m:
+        filename = urllib.parse.unquote(m.group(1).strip().strip('"\''))
+
+    # If we got HTML instead of a file, handle virus-scan warning page
+    ct = resp.headers.get("Content-Type", "")
+    if "text/html" in ct:
+        token = _get_confirm_token(resp)
+
+        if token is None:
+            raise Exception(
+                "Google Drive returned a restriction page. "
+                "Make sure the file is shared as 'Anyone with the link'."
+            )
+
+        if isinstance(token, tuple) and token[0] == "__direct__":
+            # Got a direct download URL from the page
+            resp = SESSION.get(token[1], stream=True, timeout=30)
+        else:
+            # Use confirm token
+            confirm_url = (
+                f"{GDRIVE_DOWNLOAD_URL}?id={file_id}&export=download"
+                f"&confirm={token}&uuid=1"
+            )
+            resp = SESSION.get(confirm_url, stream=True, timeout=30)
+
+        # Re-read filename from new response
+        cd2 = resp.headers.get("Content-Disposition", "")
+        m2  = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\n]+)', cd2, re.IGNORECASE)
+        if m2:
+            filename = urllib.parse.unquote(m2.group(1).strip().strip('"\''))
+
+    resp.raise_for_status()
+
+    # Determine filename
+    if not filename:
+        ct2 = resp.headers.get("Content-Type", "")
+        ext = content_type_to_ext(ct2)
+        filename = f"{file_id}{ext}" if ext else file_id
+
+    # Sanitize filename
+    filename = re.sub(r'[\\/*?:"<>|]', "_", filename).strip()
+    dest = os.path.join(dest_dir, filename)
+
+    # Stream write
+    with open(dest, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+
+    return dest
+
+
+def list_gdrive_folder(folder_id: str) -> list[dict]:
+    """
+    List files in a public Google Drive folder using the web scrape method.
+    Returns list of {id, name} dicts.
+    """
+    url  = f"https://drive.google.com/drive/folders/{folder_id}"
+    resp = SESSION.get(url, timeout=15)
+
+    # Extract file IDs and names from the page JSON blob
+    # Google embeds file data as: ["filename","","id",...]
+    files = []
+    # Pattern for file entries in the embedded JSON
+    pattern = re.findall(
+        r'\["([^"]+)","[^"]*","([a-zA-Z0-9_-]{25,})"',
+        resp.text
+    )
+    seen = set()
+    for name, fid in pattern:
+        if fid not in seen and len(fid) > 20:
+            seen.add(fid)
+            files.append({"id": fid, "name": name})
+
+    return files
+
+
+# ── Bot ───────────────────────────────────────────────────────────────────────
 
 app = Client("gdrive_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -127,10 +230,10 @@ app = Client("gdrive_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN
 async def start(client, message: Message):
     await message.reply_text(
         "👋 **Google Drive Downloader Bot**\n\n"
-        "Send me any Google Drive link and I'll send the file directly to you!\n\n"
+        "Send me any Google Drive link and I'll send the file directly!\n\n"
         "✅ Supports up to **2GB** files\n"
-        "✅ Files, folders, docs, sheets\n"
-        "⚠️ File must be set to **'Anyone with the link'**"
+        "✅ Files & folders supported\n"
+        "⚠️ File must be **'Anyone with the link'**"
     )
 
 
@@ -140,8 +243,7 @@ async def help_cmd(client, message: Message):
         "📖 **How to use:**\n\n"
         "1. Open Google Drive → right-click file → Share\n"
         "2. Set to **'Anyone with the link'**\n"
-        "3. Copy & paste the link here\n"
-        "4. Bot downloads and sends the file directly ✅"
+        "3. Paste the link here ✅"
     )
 
 
@@ -158,7 +260,7 @@ async def handle_message(client, message: Message):
         await message.reply_text("❌ Couldn't extract file ID from that link.")
         return
 
-    status = await message.reply_text("⏳ Starting download...")
+    status  = await message.reply_text("⏳ Starting...")
     tmp_dir = tempfile.mkdtemp()
 
     try:
@@ -168,7 +270,10 @@ async def handle_message(client, message: Message):
             await handle_file(client, message, status, file_id, tmp_dir)
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
-        await status.edit_text(f"❌ **Error:** {str(e)}\n\nMake sure the file is publicly shared.")
+        await status.edit_text(
+            f"❌ **Error:** {str(e)}\n\n"
+            "Make sure the file is publicly shared as 'Anyone with the link'."
+        )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -177,24 +282,13 @@ async def handle_file(client, message, status, file_id, tmp_dir):
     await status.edit_text("⬇️ Downloading from Google Drive...")
     loop = asyncio.get_event_loop()
 
-    real_name  = await loop.run_in_executor(None, lambda: get_real_filename(file_id))
-    url        = f"https://drive.google.com/uc?id={file_id}&export=download"
-    downloaded = await loop.run_in_executor(
-        None, lambda: gdown.download(url, output=tmp_dir + "/", quiet=False, fuzzy=True)
+    dest = await loop.run_in_executor(
+        None, lambda: download_gdrive_file(file_id, tmp_dir)
     )
 
-    if not downloaded or not os.path.exists(downloaded):
-        raise Exception("Download failed. File may be private or link is invalid.")
-
-    fp = Path(downloaded)
-    is_generic = fp.name == file_id or fp.name == "downloaded_file" or "." not in fp.name
-
-    if is_generic and real_name:
-        new = fp.parent / real_name; fp.rename(new); fp = new
-    else:
-        fp = fix_filename(fp)
-
+    fp        = fix_filename(Path(dest))
     file_size = fp.stat().st_size
+
     if file_size > MAX_FILE_SIZE:
         raise Exception(f"File is {human_size(file_size)} — exceeds 2GB limit.")
 
@@ -205,7 +299,8 @@ async def send_file(client, message, status, fp):
     file_size = fp.stat().st_size
     filename  = fp.name
 
-    await status.edit_text(f"📤 Sending **{filename}** ({human_size(file_size)})...")
+    if status:
+        await status.edit_text(f"📤 Uploading **{filename}** ({human_size(file_size)})...")
 
     await client.send_document(
         chat_id=message.chat.id,
@@ -213,62 +308,61 @@ async def send_file(client, message, status, fp):
         file_name=filename,
         caption=f"✅ **{filename}**\n📦 {human_size(file_size)}",
         progress=upload_progress,
-        progress_args=(status, filename),
+        progress_args=(status, filename) if status else (None, filename),
     )
 
-    await status.delete()
+    if status:
+        await status.delete()
 
 
 async def upload_progress(current, total, status, filename):
-    if total == 0: return
+    if not status or total == 0:
+        return
     pct = current * 100 // total
-    # Update every 20% to avoid flood limits
-    if pct % 20 == 0:
+    if pct % 25 == 0:
         try:
             bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-            await status.edit_text(
-                f"📤 Uploading **{filename}**\n{bar} {pct}%"
-            )
+            await status.edit_text(f"📤 **{filename}**\n{bar} {pct}%")
         except Exception:
             pass
 
 
 async def handle_folder(client, message, status, folder_id, tmp_dir):
-    url = f"https://drive.google.com/drive/folders/{folder_id}"
-    await status.edit_text("⬇️ Fetching folder contents...")
-
-    folder_dir = os.path.join(tmp_dir, "folder")
-    os.makedirs(folder_dir, exist_ok=True)
+    await status.edit_text("🔍 Reading folder...")
     loop = asyncio.get_event_loop()
 
-    await loop.run_in_executor(
-        None, lambda: gdown.download_folder(url, output=folder_dir, quiet=True, remaining_ok=True)
-    )
+    files = await loop.run_in_executor(None, lambda: list_gdrive_folder(folder_id))
 
-    all_files = sorted(
-        [f for f in Path(folder_dir).rglob("*") if f.is_file()],
-        key=lambda f: f.name.lower()
-    )
+    if not files:
+        raise Exception(
+            "No files found in folder.\n"
+            "Make sure it's shared as 'Anyone with the link'."
+        )
 
-    if not all_files:
-        raise Exception("No files found or folder is private.")
+    await status.edit_text(f"📦 Found **{len(files)}** file(s). Downloading & sending...")
 
-    await status.edit_text(f"📦 Found {len(all_files)} file(s). Sending one by one...")
+    for i, f in enumerate(files, 1):
+        await status.edit_text(
+            f"⬇️ {i}/{len(files)}: **{f['name']}**"
+        )
+        try:
+            dest = await loop.run_in_executor(
+                None, lambda fid=f["id"]: download_gdrive_file(fid, tmp_dir)
+            )
+            fp = fix_filename(Path(dest))
+            await send_file(client, message, None, fp)
+            os.remove(fp)  # free space immediately
+        except Exception as e:
+            await message.reply_text(f"⚠️ Skipped **{f['name']}**: {e}")
 
-    for i, fp in enumerate(all_files, 1):
-        fp = fix_filename(fp)
-        size = fp.stat().st_size
-        await status.edit_text(f"📤 {i}/{len(all_files)}: **{fp.name}** ({human_size(size)})")
-        await send_file(client, message, None, fp)
-
-    await status.edit_text(f"✅ Done! Sent all {len(all_files)} file(s).")
+    await status.edit_text(f"✅ Done! Sent all {len(files)} file(s).")
 
 
 def main():
-    if not BOT_TOKEN:    raise ValueError("BOT_TOKEN not set!")
-    if not API_ID:       raise ValueError("TELEGRAM_API_ID not set!")
-    if not API_HASH:     raise ValueError("TELEGRAM_API_HASH not set!")
-    logger.info("Bot starting with Pyrogram (MTProto, 2GB limit)...")
+    if not BOT_TOKEN: raise ValueError("BOT_TOKEN not set!")
+    if not API_ID:    raise ValueError("TELEGRAM_API_ID not set!")
+    if not API_HASH:  raise ValueError("TELEGRAM_API_HASH not set!")
+    logger.info("Bot starting (Pyrogram MTProto, 2GB, no gdown)...")
     app.run()
 
 
