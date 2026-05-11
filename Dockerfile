@@ -1,29 +1,34 @@
-# ---- Base image ----
+# ── Stage: final image ────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies
+# Install curl + Telegram local bot API server binary dependencies
 RUN apt-get update && apt-get install -y \
     curl \
+    libssl-dev \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first (layer caching)
-COPY requirements.txt .
+# Download the official Telegram Bot API server binary
+RUN curl -L https://github.com/tdlib/telegram-bot-api/releases/download/v7.3/telegram-bot-api-amd64-linux.zip \
+    -o /tmp/tgapi.zip \
+    && unzip /tmp/tgapi.zip -d /usr/local/bin/ \
+    && chmod +x /usr/local/bin/telegram-bot-api \
+    && rm /tmp/tgapi.zip
 
-# Install Python dependencies
+# Python deps
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source code
+# App source
 COPY . .
 
-# Expose port for Render health check
+# Health check port (for Render)
 EXPOSE 8080
 
-# Health check (Render will also probe /health)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
-# Run the app
+# Entrypoint starts local Bot API server then the Python bot
 CMD ["python", "main.py"]
