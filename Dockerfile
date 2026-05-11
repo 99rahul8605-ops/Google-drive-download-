@@ -1,32 +1,45 @@
+# ── Stage 1: Build Telegram Bot API server from source ───────────────────────
+FROM debian:bullseye-slim AS builder
+
+RUN apt-get update && apt-get install -y \
+    make \
+    git \
+    zlib1g-dev \
+    libssl-dev \
+    gperf \
+    cmake \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --recursive --depth 1 https://github.com/tdlib/telegram-bot-api.git /src
+
+RUN mkdir -p /src/build && cd /src/build && \
+    cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX:PATH=/usr/local .. && \
+    cmake --build . --target install -j$(nproc)
+
+# ── Stage 2: Runtime image ────────────────────────────────────────────────────
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install all system dependencies including unzip
 RUN apt-get update && apt-get install -y \
     curl \
-    unzip \
-    libssl-dev \
+    libssl1.1 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Download Telegram local Bot API server binary
-RUN curl -L https://github.com/tdlib/telegram-bot-api/releases/download/v7.3/telegram-bot-api-amd64-linux.zip \
-    -o /tmp/tgapi.zip \
-    && unzip /tmp/tgapi.zip -d /usr/local/bin/ \
-    && chmod +x /usr/local/bin/telegram-bot-api \
-    && rm /tmp/tgapi.zip
+# Copy compiled binary from builder
+COPY --from=builder /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
 
 # Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App source
 COPY . .
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
 CMD ["python", "main.py"]
