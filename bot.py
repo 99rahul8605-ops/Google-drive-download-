@@ -23,7 +23,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 API_ID    = int(os.environ.get("TELEGRAM_API_ID", "0"))
 API_HASH  = os.environ.get("TELEGRAM_API_HASH", "")
 
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB — Pyrogram/MTProto limit
+MAX_FILE_SIZE  = 2 * 1024 * 1024 * 1024   # 2 GB — Pyrogram/MTProto limit
+MAX_DL_SIZE   = 1800 * 1024 * 1024       # 1.8 GB — safe /tmp headroom
+
+# Global lock — only 1 download at a time to protect /tmp space
+_download_lock = asyncio.Lock()
 
 # ── Pattern matchers ──────────────────────────────────────────────────────────
 
@@ -204,6 +208,25 @@ def fix_filename(fp: Path) -> Path:
     return fp
 
 
+def get_tmp_usage() -> str:
+    """Return human-readable /tmp disk usage."""
+    try:
+        stat = shutil.disk_usage("/tmp")
+        used = stat.total - stat.free
+        return f"{human_size(used)} used / {human_size(stat.total)} total"
+    except Exception:
+        return "unknown"
+
+
+def get_remote_file_size(url: str) -> int:
+    """Return Content-Length in bytes, or 0 if unknown."""
+    try:
+        resp = requests.head(url, allow_redirects=True, timeout=10)
+        return int(resp.headers.get("Content-Length", 0))
+    except Exception:
+        return 0
+
+
 def check_aria2c():
     try:
         subprocess.run(["aria2c", "--version"], capture_output=True, check=True)
@@ -274,25 +297,33 @@ async def handle_message(client, message: Message):
         )
         return
 
+    if _download_lock.locked():
+        await message.reply_text(
+            "⏳ Ek download already chal raha hai. Please wait karein."
+        )
+        return
+
     status  = await message.reply_text("⏳ Processing link...")
-    tmp_dir = tempfile.mkdtemp()
+    tmp_dir = tempfile.mkdtemp(dir="/tmp")
 
     try:
-        if link_type == "gdrive_folder":
-            await handle_gdrive_folder(client, message, status, identifier, tmp_dir)
-        elif link_type == "gdrive_file":
-            await handle_gdrive_file(client, message, status, identifier, tmp_dir)
-        elif link_type == "ytdlp":
-            await handle_ytdlp(client, message, status, identifier, tmp_dir)
-        elif link_type == "direct":
-            await handle_direct(client, message, status, identifier, tmp_dir)
-        elif link_type == "magnet":
-            await handle_magnet(client, message, status, identifier, tmp_dir)
+        async with _download_lock:
+            if link_type == "gdrive_folder":
+                await handle_gdrive_folder(client, message, status, identifier, tmp_dir)
+            elif link_type == "gdrive_file":
+                await handle_gdrive_file(client, message, status, identifier, tmp_dir)
+            elif link_type == "ytdlp":
+                await handle_ytdlp(client, message, status, identifier, tmp_dir)
+            elif link_type == "direct":
+                await handle_direct(client, message, status, identifier, tmp_dir)
+            elif link_type == "magnet":
+                await handle_magnet(client, message, status, identifier, tmp_dir)
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
         await status.edit_text(f"❌ **Error:** {str(e)}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.info(f"/tmp after cleanup: {get_tmp_usage()}")
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
@@ -359,22 +390,37 @@ async def handle_gdrive_folder(client, message, status, folder_id, tmp_dir):
 
 async def handle_direct(client, message, status, url, tmp_dir):
     """Download any direct HTTP/HTTPS file link using requests with streaming."""
-    await status.edit_text("⬇️ Downloading direct link...")
-    loop      = asyncio.get_event_loop()
+    loop = asyncio.get_event_loop()
+
+    # ── Pre-download size check via HEAD ──────────────────────────────────────
+    await status.edit_text("🔍 Checking file size...")
+    remote_size = await loop.run_in_executor(None, lambda: get_remote_file_size(url))
+    if remote_size > MAX_DL_SIZE:
+        raise Exception(
+            f"File is too large: **{human_size(remote_size)}**\n"
+            f"Max allowed: {human_size(MAX_DL_SIZE)} (to keep /tmp safe)"
+        )
+
+    # ── Check available /tmp space ────────────────────────────────────────────
+    tmp_free = shutil.disk_usage("/tmp").free
+    if remote_size > 0 and remote_size > tmp_free:
+        raise Exception(
+            f"Not enough disk space in /tmp.\n"
+            f"Need: {human_size(remote_size)}, Free: {human_size(tmp_free)}"
+        )
+
     filename  = await loop.run_in_executor(None, lambda: get_direct_filename(url))
     dest_path = os.path.join(tmp_dir, filename)
 
+    await status.edit_text(f"⬇️ Downloading **{filename}**...")
+
     def _download():
-        with requests.get(url, stream=True, timeout=30, allow_redirects=True) as r:
+        with requests.get(url, stream=True, timeout=60, allow_redirects=True) as r:
             r.raise_for_status()
-            total    = int(r.headers.get("Content-Length", 0))
-            received = 0
             with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):  # 4MB chunks
                     if chunk:
                         f.write(chunk)
-                        received += len(chunk)
-            return total or received
 
     await loop.run_in_executor(None, _download)
 
@@ -404,9 +450,13 @@ async def handle_ytdlp(client, message, status, url, tmp_dir):
 
     cmd = [
         "yt-dlp",
-        "--no-playlist",            # single video only (unless playlist URL)
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--no-playlist",
+        "-f", (
+            f"bestvideo[ext=mp4][filesize<{MAX_DL_SIZE}]"
+            f"+bestaudio[ext=m4a]/best[ext=mp4][filesize<{MAX_DL_SIZE}]/best"
+        ),
         "--merge-output-format", "mp4",
+        "--max-filesize", str(MAX_DL_SIZE),
         "--output", outtmpl,
         "--no-warnings",
         url,
@@ -491,24 +541,62 @@ async def handle_magnet(client, message, status, magnet, tmp_dir):
 
 # ── Shared send logic ─────────────────────────────────────────────────────────
 
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v", ".3gp"}
+AUDIO_EXTS = {".mp3", ".m4a", ".ogg", ".flac", ".wav", ".aac", ".opus"}
+
+
 async def send_file(client, message, status, fp: Path):
     file_size = fp.stat().st_size
     filename  = fp.name
+    ext       = fp.suffix.lower()
 
     if status:
         await status.edit_text(f"📤 Sending **{filename}** ({human_size(file_size)})...")
 
-    await client.send_document(
-        chat_id=message.chat.id,
-        document=str(fp),
-        file_name=filename,
-        caption=f"✅ **{filename}**\n📦 {human_size(file_size)}",
-        progress=upload_progress,
-        progress_args=(status, filename),
-    )
+    caption = f"✅ **{filename}**\n📦 {human_size(file_size)}"
+
+    if ext in VIDEO_EXTS:
+        # Send as proper video — prevents Telegram converting to GIF
+        await client.send_video(
+            chat_id=message.chat.id,
+            video=str(fp),
+            file_name=filename,
+            caption=caption,
+            supports_streaming=True,
+            progress=upload_progress,
+            progress_args=(status, filename),
+        )
+    elif ext in AUDIO_EXTS:
+        await client.send_audio(
+            chat_id=message.chat.id,
+            audio=str(fp),
+            file_name=filename,
+            caption=caption,
+            progress=upload_progress,
+            progress_args=(status, filename),
+        )
+    else:
+        await client.send_document(
+            chat_id=message.chat.id,
+            document=str(fp),
+            file_name=filename,
+            caption=caption,
+            progress=upload_progress,
+            progress_args=(status, filename),
+        )
+
+    # ── Delete immediately after upload to free /tmp ──────────────────────────
+    try:
+        fp.unlink()
+        logger.info(f"Deleted after upload: {filename} | /tmp: {get_tmp_usage()}")
+    except Exception as e:
+        logger.warning(f"Could not delete {filename}: {e}")
 
     if status:
-        await status.delete()
+        try:
+            await status.delete()
+        except Exception:
+            pass
 
 
 async def upload_progress(current, total, status, filename):
