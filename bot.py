@@ -5,6 +5,7 @@ import asyncio
 import tempfile
 import shutil
 import urllib.parse
+import subprocess
 from pathlib import Path
 
 import gdown
@@ -18,9 +19,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
-API_ID       = int(os.environ.get("TELEGRAM_API_ID", "0"))
-API_HASH     = os.environ.get("TELEGRAM_API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+API_ID    = int(os.environ.get("TELEGRAM_API_ID", "0"))
+API_HASH  = os.environ.get("TELEGRAM_API_HASH", "")
+
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB — Pyrogram/MTProto limit
+
+# ── Pattern matchers ──────────────────────────────────────────────────────────
 
 GDRIVE_PATTERNS = [
     r"https://drive\.google\.com/file/d/([a-zA-Z0-9_-]+)",
@@ -33,20 +38,73 @@ FOLDER_PATTERNS = [
     r"https://drive\.google\.com/drive/folders/([a-zA-Z0-9_-]+)",
 ]
 
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB — Pyrogram/MTProto limit
+# Sites handled by yt-dlp (video/audio platforms)
+YTDLP_DOMAINS = [
+    "youtube.com", "youtu.be",
+    "instagram.com",
+    "twitter.com", "x.com",
+    "tiktok.com",
+    "facebook.com", "fb.watch",
+    "reddit.com",
+    "dailymotion.com",
+    "vimeo.com",
+    "twitch.tv",
+    "soundcloud.com",
+    "pinterest.com",
+    "streamable.com",
+    "bilibili.com",
+    "rumble.com",
+    "odysee.com",
+    "kick.com",
+]
+
+MAGNET_PATTERN = re.compile(r"magnet:\?xt=urn:[a-zA-Z0-9]+:[a-fA-F0-9]{32,40}", re.IGNORECASE)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Link type detection ───────────────────────────────────────────────────────
 
-def extract_file_id(url):
+def detect_link_type(text: str):
+    """
+    Returns (identifier, type) where type is one of:
+      'gdrive_folder', 'gdrive_file', 'ytdlp', 'magnet', 'direct', 'unknown'
+    """
+    text = text.strip()
+
+    # Magnet link
+    if MAGNET_PATTERN.match(text):
+        return text, "magnet"
+
+    # Google Drive folder
     for p in FOLDER_PATTERNS:
-        m = re.search(p, url)
-        if m: return m.group(1), "folder"
-    for p in GDRIVE_PATTERNS:
-        m = re.search(p, url)
-        if m: return m.group(1), "file"
+        m = re.search(p, text)
+        if m:
+            return m.group(1), "gdrive_folder"
+
+    # Google Drive file
+    if "drive.google.com" in text or "docs.google.com" in text:
+        for p in GDRIVE_PATTERNS:
+            m = re.search(p, text)
+            if m:
+                return m.group(1), "gdrive_file"
+        return None, "unknown"
+
+    # yt-dlp supported sites
+    try:
+        parsed = urllib.parse.urlparse(text)
+        domain = parsed.netloc.lower().lstrip("www.")
+        if any(domain == d or domain.endswith("." + d) for d in YTDLP_DOMAINS):
+            return text, "ytdlp"
+    except Exception:
+        pass
+
+    # Generic direct HTTP/HTTPS link
+    if re.match(r"https?://", text):
+        return text, "direct"
+
     return None, "unknown"
 
+
+# ── Utility helpers ───────────────────────────────────────────────────────────
 
 def get_real_filename(file_id):
     try:
@@ -56,13 +114,41 @@ def get_real_filename(file_id):
         m    = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\n]+)', cd, re.IGNORECASE)
         if m:
             name = urllib.parse.unquote(m.group(1).strip().strip('"\''))
-            if name: return name
+            if name:
+                return name
         ct  = resp.headers.get("Content-Type", "")
         ext = content_type_to_ext(ct)
-        if ext: return f"file{ext}"
+        if ext:
+            return f"file{ext}"
     except Exception as e:
         logger.warning(f"Filename fetch failed: {e}")
     return None
+
+
+def get_direct_filename(url: str) -> str | None:
+    """Try to determine filename from URL or Content-Disposition header."""
+    try:
+        resp = requests.head(url, allow_redirects=True, timeout=10)
+        cd   = resp.headers.get("Content-Disposition", "")
+        m    = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\n]+)', cd, re.IGNORECASE)
+        if m:
+            name = urllib.parse.unquote(m.group(1).strip().strip('"\''))
+            if name:
+                return name
+        # Fallback: last segment of URL path
+        path = urllib.parse.urlparse(url).path
+        name = urllib.parse.unquote(path.rstrip("/").split("/")[-1])
+        if name and "." in name:
+            return name
+        # Try Content-Type
+        ct  = resp.headers.get("Content-Type", "")
+        ext = content_type_to_ext(ct)
+        return f"file{ext}" if ext else "downloaded_file"
+    except Exception as e:
+        logger.warning(f"Direct filename fetch failed: {e}")
+    path = urllib.parse.urlparse(url).path
+    name = urllib.parse.unquote(path.rstrip("/").split("/")[-1])
+    return name if name else "downloaded_file"
 
 
 def content_type_to_ext(ct):
@@ -95,20 +181,20 @@ def sniff_extension(filepath):
         with open(filepath, "rb") as f:
             h = f.read(8)
         for magic, ext in sigs.items():
-            if h.startswith(magic): return ext
+            if h.startswith(magic):
+                return ext
     except Exception:
         pass
     return ""
 
 
 def human_size(b):
-    if b < 1024**2:    return f"{b/1024:.1f} KB"
-    if b < 1024**3:    return f"{b/1024**2:.1f} MB"
-    return f"{b/1024**3:.2f} GB"
+    if b < 1024 ** 2: return f"{b / 1024:.1f} KB"
+    if b < 1024 ** 3: return f"{b / 1024 ** 2:.1f} MB"
+    return f"{b / 1024 ** 3:.2f} GB"
 
 
 def fix_filename(fp: Path) -> Path:
-    """Rename file if it has no extension."""
     if "." not in fp.name:
         ext = sniff_extension(str(fp))
         if ext:
@@ -118,7 +204,23 @@ def fix_filename(fp: Path) -> Path:
     return fp
 
 
-# ── Bot logic ─────────────────────────────────────────────────────────────────
+def check_aria2c():
+    try:
+        subprocess.run(["aria2c", "--version"], capture_output=True, check=True)
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+
+
+def check_ytdlp():
+    try:
+        subprocess.run(["yt-dlp", "--version"], capture_output=True, check=True)
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+
+
+# ── Bot setup ─────────────────────────────────────────────────────────────────
 
 app = Client("gdrive_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -126,22 +228,35 @@ app = Client("gdrive_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN
 @app.on_message(filters.command("start"))
 async def start(client, message: Message):
     await message.reply_text(
-        "👋 **Google Drive Downloader Bot**\n\n"
-        "Send me any Google Drive link and I'll send the file directly to you!\n\n"
-        "✅ Supports up to **2GB** files\n"
-        "✅ Files, folders, docs, sheets\n"
-        "⚠️ File must be set to **'Anyone with the link'**"
+        "👋 **Universal Downloader Bot**\n\n"
+        "Send me any supported link and I'll download and send the file!\n\n"
+        "✅ **Google Drive** (files & folders)\n"
+        "✅ **Direct links** (HTTP/HTTPS — any file)\n"
+        "✅ **Video sites** — YouTube, Instagram, Twitter/X, TikTok, Facebook, Reddit, Vimeo, Twitch, and 1000+ more\n"
+        "✅ **Magnet links** (requires aria2c installed)\n\n"
+        "⚠️ Max file size: **2 GB**\n"
+        "Use /help for more details."
     )
 
 
 @app.on_message(filters.command("help"))
 async def help_cmd(client, message: Message):
     await message.reply_text(
-        "📖 **How to use:**\n\n"
-        "1. Open Google Drive → right-click file → Share\n"
-        "2. Set to **'Anyone with the link'**\n"
-        "3. Copy & paste the link here\n"
-        "4. Bot downloads and sends the file directly ✅"
+        "📖 **Supported link types:**\n\n"
+        "**1. Google Drive**\n"
+        "   • Share file → Anyone with link\n"
+        "   • Paste the link here\n\n"
+        "**2. Direct file links**\n"
+        "   • Any `http://` or `https://` link that points to a file\n"
+        "   • Example: `https://example.com/file.zip`\n\n"
+        "**3. Video/Media platforms**\n"
+        "   • YouTube, Instagram, Twitter/X, TikTok, Facebook\n"
+        "   • Reddit, Vimeo, Twitch, Dailymotion, SoundCloud and more\n"
+        "   • Powered by **yt-dlp**\n\n"
+        "**4. Magnet links**\n"
+        "   • Paste a `magnet:?xt=...` link\n"
+        "   • Requires **aria2c** installed on server\n\n"
+        "⚠️ All links must be publicly accessible."
     )
 
 
@@ -149,31 +264,40 @@ async def help_cmd(client, message: Message):
 async def handle_message(client, message: Message):
     text = message.text.strip()
 
-    if "drive.google.com" not in text and "docs.google.com" not in text:
-        await message.reply_text("❓ Please send a Google Drive link. Use /help for instructions.")
+    identifier, link_type = detect_link_type(text)
+
+    if link_type == "unknown" or identifier is None:
+        await message.reply_text(
+            "❓ Unsupported link.\n\n"
+            "Send a **Google Drive**, **direct file**, **video site**, or **magnet** link.\n"
+            "Use /help to see all supported sources."
+        )
         return
 
-    file_id, link_type = extract_file_id(text)
-    if not file_id:
-        await message.reply_text("❌ Couldn't extract file ID from that link.")
-        return
-
-    status = await message.reply_text("⏳ Starting download...")
+    status  = await message.reply_text("⏳ Processing link...")
     tmp_dir = tempfile.mkdtemp()
 
     try:
-        if link_type == "folder":
-            await handle_folder(client, message, status, file_id, tmp_dir)
-        else:
-            await handle_file(client, message, status, file_id, tmp_dir)
+        if link_type == "gdrive_folder":
+            await handle_gdrive_folder(client, message, status, identifier, tmp_dir)
+        elif link_type == "gdrive_file":
+            await handle_gdrive_file(client, message, status, identifier, tmp_dir)
+        elif link_type == "ytdlp":
+            await handle_ytdlp(client, message, status, identifier, tmp_dir)
+        elif link_type == "direct":
+            await handle_direct(client, message, status, identifier, tmp_dir)
+        elif link_type == "magnet":
+            await handle_magnet(client, message, status, identifier, tmp_dir)
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
-        await status.edit_text(f"❌ **Error:** {str(e)}\n\nMake sure the file is publicly shared.")
+        await status.edit_text(f"❌ **Error:** {str(e)}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-async def handle_file(client, message, status, file_id, tmp_dir):
+# ── Handlers ──────────────────────────────────────────────────────────────────
+
+async def handle_gdrive_file(client, message, status, file_id, tmp_dir):
     await status.edit_text("⬇️ Downloading from Google Drive...")
     loop = asyncio.get_event_loop()
 
@@ -184,63 +308,32 @@ async def handle_file(client, message, status, file_id, tmp_dir):
     )
 
     if not downloaded or not os.path.exists(downloaded):
-        raise Exception("Download failed. File may be private or link is invalid.")
+        raise Exception("Download failed. File may be private or the link is invalid.")
 
-    fp = Path(downloaded)
-    is_generic = fp.name == file_id or fp.name == "downloaded_file" or "." not in fp.name
+    fp          = Path(downloaded)
+    is_generic  = fp.name == file_id or fp.name == "downloaded_file" or "." not in fp.name
 
     if is_generic and real_name:
-        new = fp.parent / real_name; fp.rename(new); fp = new
+        new = fp.parent / real_name
+        fp.rename(new)
+        fp = new
     else:
         fp = fix_filename(fp)
 
     file_size = fp.stat().st_size
     if file_size > MAX_FILE_SIZE:
-        raise Exception(f"File is {human_size(file_size)} — exceeds 2GB limit.")
+        raise Exception(f"File is {human_size(file_size)} — exceeds 2 GB limit.")
 
     await send_file(client, message, status, fp)
 
 
-async def send_file(client, message, status, fp):
-    file_size = fp.stat().st_size
-    filename  = fp.name
-
-    await status.edit_text(f"📤 Sending **{filename}** ({human_size(file_size)})...")
-
-    await client.send_document(
-        chat_id=message.chat.id,
-        document=str(fp),
-        file_name=filename,
-        caption=f"✅ **{filename}**\n📦 {human_size(file_size)}",
-        progress=upload_progress,
-        progress_args=(status, filename),
-    )
-
-    await status.delete()
-
-
-async def upload_progress(current, total, status, filename):
-    if total == 0: return
-    pct = current * 100 // total
-    # Update every 20% to avoid flood limits
-    if pct % 20 == 0:
-        try:
-            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-            await status.edit_text(
-                f"📤 Uploading **{filename}**\n{bar} {pct}%"
-            )
-        except Exception:
-            pass
-
-
-async def handle_folder(client, message, status, folder_id, tmp_dir):
-    url = f"https://drive.google.com/drive/folders/{folder_id}"
-    await status.edit_text("⬇️ Fetching folder contents...")
-
+async def handle_gdrive_folder(client, message, status, folder_id, tmp_dir):
+    url        = f"https://drive.google.com/drive/folders/{folder_id}"
     folder_dir = os.path.join(tmp_dir, "folder")
     os.makedirs(folder_dir, exist_ok=True)
     loop = asyncio.get_event_loop()
 
+    await status.edit_text("⬇️ Fetching folder contents from Google Drive...")
     await loop.run_in_executor(
         None, lambda: gdown.download_folder(url, output=folder_dir, quiet=True, remaining_ok=True)
     )
@@ -256,7 +349,7 @@ async def handle_folder(client, message, status, folder_id, tmp_dir):
     await status.edit_text(f"📦 Found {len(all_files)} file(s). Sending one by one...")
 
     for i, fp in enumerate(all_files, 1):
-        fp = fix_filename(fp)
+        fp   = fix_filename(fp)
         size = fp.stat().st_size
         await status.edit_text(f"📤 {i}/{len(all_files)}: **{fp.name}** ({human_size(size)})")
         await send_file(client, message, None, fp)
@@ -264,11 +357,193 @@ async def handle_folder(client, message, status, folder_id, tmp_dir):
     await status.edit_text(f"✅ Done! Sent all {len(all_files)} file(s).")
 
 
+async def handle_direct(client, message, status, url, tmp_dir):
+    """Download any direct HTTP/HTTPS file link using requests with streaming."""
+    await status.edit_text("⬇️ Downloading direct link...")
+    loop      = asyncio.get_event_loop()
+    filename  = await loop.run_in_executor(None, lambda: get_direct_filename(url))
+    dest_path = os.path.join(tmp_dir, filename)
+
+    def _download():
+        with requests.get(url, stream=True, timeout=30, allow_redirects=True) as r:
+            r.raise_for_status()
+            total    = int(r.headers.get("Content-Length", 0))
+            received = 0
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        received += len(chunk)
+            return total or received
+
+    await loop.run_in_executor(None, _download)
+
+    fp = fix_filename(Path(dest_path))
+    if not fp.exists():
+        raise Exception("Direct download failed — file not created.")
+
+    file_size = fp.stat().st_size
+    if file_size > MAX_FILE_SIZE:
+        raise Exception(f"File is {human_size(file_size)} — exceeds 2 GB limit.")
+
+    await send_file(client, message, status, fp)
+
+
+async def handle_ytdlp(client, message, status, url, tmp_dir):
+    """Download video/audio from 1000+ sites using yt-dlp."""
+    if not check_ytdlp():
+        raise Exception(
+            "yt-dlp is not installed on this server.\n"
+            "Install it: `pip install yt-dlp` or `apt install yt-dlp`"
+        )
+
+    await status.edit_text("🔍 Fetching media info via yt-dlp...")
+    loop = asyncio.get_event_loop()
+
+    outtmpl = os.path.join(tmp_dir, "%(title).60s.%(ext)s")
+
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",            # single video only (unless playlist URL)
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
+        "--output", outtmpl,
+        "--no-warnings",
+        url,
+    ]
+
+    await status.edit_text("⬇️ Downloading via yt-dlp...")
+
+    def _run():
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise Exception(result.stderr.strip() or "yt-dlp failed with no error output.")
+        return result
+
+    await loop.run_in_executor(None, _run)
+
+    files = [f for f in Path(tmp_dir).iterdir() if f.is_file()]
+    if not files:
+        raise Exception("yt-dlp ran but no output file was created.")
+
+    for fp in sorted(files, key=lambda f: f.stat().st_size, reverse=True):
+        size = fp.stat().st_size
+        if size > MAX_FILE_SIZE:
+            raise Exception(f"Downloaded file is {human_size(size)} — exceeds 2 GB limit.")
+        await send_file(client, message, status, fp)
+
+
+async def handle_magnet(client, message, status, magnet, tmp_dir):
+    """Download torrent via magnet link using aria2c."""
+    if not check_aria2c():
+        raise Exception(
+            "aria2c is not installed on this server.\n"
+            "Install it: `apt install aria2` (Linux) or `brew install aria2` (Mac)"
+        )
+
+    await status.edit_text(
+        "🧲 Starting magnet download via aria2c...\n"
+        "⚠️ This may take time depending on seeders."
+    )
+    loop = asyncio.get_event_loop()
+
+    cmd = [
+        "aria2c",
+        "--dir", tmp_dir,
+        "--seed-time=0",            # don't seed after download
+        "--max-connection-per-server=4",
+        "--split=4",
+        "--bt-stop-timeout=300",    # stop if no progress in 5 min
+        "--timeout=60",
+        "--follow-metalink=true",
+        magnet,
+    ]
+
+    def _run():
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        if result.returncode != 0:
+            raise Exception(result.stderr.strip() or "aria2c failed.")
+        return result
+
+    try:
+        await loop.run_in_executor(None, _run)
+    except subprocess.TimeoutExpired:
+        raise Exception("Magnet download timed out (15 min). Try a magnet with more seeders.")
+
+    files = [f for f in Path(tmp_dir).rglob("*") if f.is_file()]
+    if not files:
+        raise Exception("No files downloaded from magnet. Possibly no seeders or timeout.")
+
+    await status.edit_text(f"📦 Torrent downloaded: {len(files)} file(s). Sending...")
+
+    for i, fp in enumerate(sorted(files, key=lambda f: f.name.lower()), 1):
+        size = fp.stat().st_size
+        if size > MAX_FILE_SIZE:
+            await status.edit_text(
+                f"⚠️ Skipping **{fp.name}** ({human_size(size)}) — exceeds 2 GB limit."
+            )
+            continue
+        await status.edit_text(f"📤 {i}/{len(files)}: **{fp.name}** ({human_size(size)})")
+        await send_file(client, message, None, fp)
+
+    await status.edit_text(f"✅ Done! Sent {len(files)} file(s) from magnet.")
+
+
+# ── Shared send logic ─────────────────────────────────────────────────────────
+
+async def send_file(client, message, status, fp: Path):
+    file_size = fp.stat().st_size
+    filename  = fp.name
+
+    if status:
+        await status.edit_text(f"📤 Sending **{filename}** ({human_size(file_size)})...")
+
+    await client.send_document(
+        chat_id=message.chat.id,
+        document=str(fp),
+        file_name=filename,
+        caption=f"✅ **{filename}**\n📦 {human_size(file_size)}",
+        progress=upload_progress,
+        progress_args=(status, filename),
+    )
+
+    if status:
+        await status.delete()
+
+
+async def upload_progress(current, total, status, filename):
+    if total == 0 or status is None:
+        return
+    pct = current * 100 // total
+    if pct % 20 == 0:
+        try:
+            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            await status.edit_text(
+                f"📤 Uploading **{filename}**\n{bar} {pct}%"
+            )
+        except Exception:
+            pass
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
 def main():
-    if not BOT_TOKEN:    raise ValueError("BOT_TOKEN not set!")
-    if not API_ID:       raise ValueError("TELEGRAM_API_ID not set!")
-    if not API_HASH:     raise ValueError("TELEGRAM_API_HASH not set!")
-    logger.info("Bot starting with Pyrogram (MTProto, 2GB limit)...")
+    if not BOT_TOKEN: raise ValueError("BOT_TOKEN not set!")
+    if not API_ID:    raise ValueError("TELEGRAM_API_ID not set!")
+    if not API_HASH:  raise ValueError("TELEGRAM_API_HASH not set!")
+
+    logger.info("Checking optional dependencies...")
+    if check_ytdlp():
+        logger.info("✅ yt-dlp found — video site downloads enabled")
+    else:
+        logger.warning("⚠️  yt-dlp not found — install with: pip install yt-dlp")
+
+    if check_aria2c():
+        logger.info("✅ aria2c found — magnet/torrent downloads enabled")
+    else:
+        logger.warning("⚠️  aria2c not found — install with: apt install aria2")
+
+    logger.info("Bot starting...")
     app.run()
 
 
