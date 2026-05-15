@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import logging
 import asyncio
 import tempfile
@@ -67,6 +68,8 @@ MAGNET_PATTERN = re.compile(r"magnet:\?xt=urn:[a-zA-Z0-9]+:[a-fA-F0-9]{32,40}", 
 
 # ── Link type detection ───────────────────────────────────────────────────────
 
+STREAM_EXTS = {".m3u8", ".m3u", ".mpd", ".f4m"}
+
 def detect_link_type(text: str):
     """
     Returns (identifier, type) where type is one of:
@@ -103,6 +106,10 @@ def detect_link_type(text: str):
 
     # Generic direct HTTP/HTTPS link
     if re.match(r"https?://", text):
+        # Check if it's a stream URL → route to yt-dlp
+        parsed_path = urllib.parse.urlparse(text).path.lower()
+        if any(parsed_path.endswith(ext) for ext in STREAM_EXTS):
+            return text, "ytdlp"
         return text, "direct"
 
     return None, "unknown"
@@ -389,64 +396,134 @@ async def handle_gdrive_folder(client, message, status, folder_id, tmp_dir):
 
 
 async def handle_direct(client, message, status, url, tmp_dir):
-    """Download any direct HTTP/HTTPS file link using requests with streaming."""
+    """Stream file directly from URL to Telegram via MTProto — no disk needed."""
     loop = asyncio.get_event_loop()
 
-    # ── Pre-download size check via HEAD ──────────────────────────────────────
-    await status.edit_text("🔍 Checking file size...")
+    # ── Pre-check size ────────────────────────────────────────────────────────
+    await status.edit_text("🔍 Checking file info...")
     remote_size = await loop.run_in_executor(None, lambda: get_remote_file_size(url))
     if remote_size > MAX_DL_SIZE:
         raise Exception(
-            f"File is too large: **{human_size(remote_size)}**\n"
-            f"Max allowed: {human_size(MAX_DL_SIZE)} (to keep /tmp safe)"
+            f"File too large: **{human_size(remote_size)}**\n"
+            f"Max allowed: {human_size(MAX_DL_SIZE)}"
         )
 
-    # ── Check available /tmp space ────────────────────────────────────────────
-    tmp_free = shutil.disk_usage("/tmp").free
-    if remote_size > 0 and remote_size > tmp_free:
-        raise Exception(
-            f"Not enough disk space in /tmp.\n"
-            f"Need: {human_size(remote_size)}, Free: {human_size(tmp_free)}"
-        )
+    filename = await loop.run_in_executor(None, lambda: get_direct_filename(url))
+    ext      = Path(filename).suffix.lower()
 
-    filename  = await loop.run_in_executor(None, lambda: get_direct_filename(url))
+    await status.edit_text(f"📡 Streaming **{filename}** ({human_size(remote_size) if remote_size else '?'})...")
+
+    # ── MTProto stream — no disk, chunks seedha upload ───────────────────────
+    class StreamReader(io.RawIOBase):
+        def __init__(self):
+            self.resp = requests.get(url, stream=True, timeout=60, allow_redirects=True)
+            self.resp.raise_for_status()
+            self._iter = self.resp.iter_content(4 * 1024 * 1024)  # 4MB chunks
+
+        def readinto(self, b):
+            try:
+                chunk = next(self._iter)
+                n = len(chunk)
+                b[:n] = chunk
+                return n
+            except StopIteration:
+                return 0
+
+        def readable(self):
+            return True
+
+        def close(self):
+            try:
+                self.resp.close()
+            except Exception:
+                pass
+            super().close()
+
+    reader  = io.BufferedReader(StreamReader(), buffer_size=8 * 1024 * 1024)
+    caption = f"✅ **{filename}**" + (f"\n📦 {human_size(remote_size)}" if remote_size else "")
+
+    try:
+        if ext in VIDEO_EXTS:
+            await client.send_video(
+                chat_id=message.chat.id,
+                video=reader,
+                file_name=filename,
+                caption=caption,
+                supports_streaming=True,
+                progress=upload_progress,
+                progress_args=(status, filename),
+            )
+        elif ext in AUDIO_EXTS:
+            await client.send_audio(
+                chat_id=message.chat.id,
+                audio=reader,
+                file_name=filename,
+                caption=caption,
+                progress=upload_progress,
+                progress_args=(status, filename),
+            )
+        else:
+            await client.send_document(
+                chat_id=message.chat.id,
+                document=reader,
+                file_name=filename,
+                caption=caption,
+                progress=upload_progress,
+                progress_args=(status, filename),
+            )
+    except Exception as e:
+        reader.close()
+        # Fallback: agar stream seek issue aaye toh disk pe download karke bhejo
+        logger.warning(f"Stream upload failed ({e}), falling back to disk...")
+        await status.edit_text("⚠️ Stream failed, disk fallback use ho raha hai...")
+        await _direct_disk_fallback(client, message, status, url, filename, tmp_dir)
+        return
+
+    reader.close()
+
+    if status:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+
+async def _direct_disk_fallback(client, message, status, url, filename, tmp_dir):
+    """Disk-based fallback agar MTProto stream seek kare."""
     dest_path = os.path.join(tmp_dir, filename)
-
-    await status.edit_text(f"⬇️ Downloading **{filename}**...")
+    loop      = asyncio.get_event_loop()
 
     def _download():
         with requests.get(url, stream=True, timeout=60, allow_redirects=True) as r:
             r.raise_for_status()
             with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):  # 4MB chunks
+                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
                     if chunk:
                         f.write(chunk)
 
     await loop.run_in_executor(None, _download)
-
     fp = fix_filename(Path(dest_path))
-    if not fp.exists():
-        raise Exception("Direct download failed — file not created.")
-
-    file_size = fp.stat().st_size
-    if file_size > MAX_FILE_SIZE:
-        raise Exception(f"File is {human_size(file_size)} — exceeds 2 GB limit.")
-
     await send_file(client, message, status, fp)
 
 
 async def handle_ytdlp(client, message, status, url, tmp_dir):
-    """Download video/audio from 1000+ sites using yt-dlp."""
+    """Download video/audio/streams from 1000+ sites using yt-dlp."""
     if not check_ytdlp():
         raise Exception(
             "yt-dlp is not installed on this server.\n"
-            "Install it: `pip install yt-dlp` or `apt install yt-dlp`"
+            "Install: `pip install yt-dlp`"
         )
 
-    await status.edit_text("🔍 Fetching media info via yt-dlp...")
+    await status.edit_text("🔍 Fetching media info...")
     loop = asyncio.get_event_loop()
 
-    outtmpl = os.path.join(tmp_dir, "%(title).60s.%(ext)s")
+    # Raw stream URLs (.m3u8 etc) won't have a title → use timestamp as name
+    parsed_path = urllib.parse.urlparse(url).path.lower()
+    is_stream   = any(parsed_path.endswith(ext) for ext in STREAM_EXTS)
+    outtmpl     = os.path.join(
+        tmp_dir,
+        "stream_%(id)s.%(ext)s" if is_stream else "%(title).60s.%(ext)s"
+    )
 
     cmd = [
         "yt-dlp",
@@ -459,15 +536,18 @@ async def handle_ytdlp(client, message, status, url, tmp_dir):
         "--max-filesize", str(MAX_DL_SIZE),
         "--output", outtmpl,
         "--no-warnings",
+        "--hls-prefer-ffmpeg",   # better HLS/m3u8 stream handling
         url,
     ]
 
-    await status.edit_text("⬇️ Downloading via yt-dlp...")
+    await status.edit_text(
+        "⬇️ Downloading stream (HLS)..." if is_stream else "⬇️ Downloading via yt-dlp..."
+    )
 
     def _run():
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
-            raise Exception(result.stderr.strip() or "yt-dlp failed with no error output.")
+            raise Exception(result.stderr.strip() or "yt-dlp failed.")
         return result
 
     await loop.run_in_executor(None, _run)
