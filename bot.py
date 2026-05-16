@@ -260,6 +260,7 @@ async def split_and_send(send_fn, edit, fp: Path):
         pass
 
     await edit(f"✅ Sent all {total_parts} parts of **{fp.name}**")
+    logger.info(f"/tmp after split+send: {get_tmp_usage()}")
 
 def get_tmp_usage() -> str:
     try:
@@ -267,6 +268,30 @@ def get_tmp_usage() -> str:
         return f"{human_size(stat.total - stat.free)} / {human_size(stat.total)}"
     except Exception:
         return "unknown"
+
+def get_tmp_free_bytes() -> int:
+    try:
+        return shutil.disk_usage("/tmp").free
+    except Exception:
+        return 0
+
+def cleanup_stale_tmp(min_free_bytes: int = 500 * 1024 * 1024):
+    """Delete old bot tmp dirs if free space is below min_free_bytes (default 500 MB)."""
+    if get_tmp_free_bytes() >= min_free_bytes:
+        return
+    logger.warning(f"/tmp low on space ({get_tmp_usage()}), cleaning stale dirs...")
+    try:
+        for entry in sorted(Path("/tmp").iterdir(), key=lambda p: p.stat().st_mtime):
+            if entry.is_dir() and entry.name.startswith("tmp"):
+                try:
+                    shutil.rmtree(entry, ignore_errors=True)
+                    logger.info(f"Cleaned stale dir: {entry}")
+                except Exception:
+                    pass
+                if get_tmp_free_bytes() >= min_free_bytes:
+                    break
+    except Exception as e:
+        logger.warning(f"cleanup_stale_tmp failed: {e}")
 
 def auto_restart():
     """Restart the bot process with same arguments."""
@@ -328,6 +353,7 @@ def settings_text() -> str:
 # ── Download handlers (library-agnostic) ─────────────────────────────────────
 
 async def handle_gdrive_file(send_fn, edit, file_id, tmp_dir):
+    cleanup_stale_tmp()
     await edit("⬇️ Downloading from Google Drive...")
     loop      = asyncio.get_running_loop()
     real_name = await loop.run_in_executor(None, lambda: get_real_filename(file_id))
@@ -349,6 +375,7 @@ async def handle_gdrive_file(send_fn, edit, file_id, tmp_dir):
 
 
 async def handle_gdrive_folder(send_fn, edit, folder_id, tmp_dir):
+    cleanup_stale_tmp()
     folder_dir = os.path.join(tmp_dir, "folder")
     os.makedirs(folder_dir, exist_ok=True)
     loop = asyncio.get_running_loop()
@@ -370,23 +397,79 @@ async def handle_gdrive_folder(send_fn, edit, folder_id, tmp_dir):
 
 
 async def handle_direct(send_fn, edit, url, tmp_dir):
-    loop = asyncio.get_running_loop()
+    """Stream directly from URL to Telegram — no /tmp disk usage for files under 2 GB.
+    Falls back to disk for files that need splitting (> 2 GB)."""
+    import io
+    loop     = asyncio.get_running_loop()
+    cancel   = get_cancel_event()
+
     await edit("🔍 Checking file info...")
     remote_size = await loop.run_in_executor(None, lambda: get_remote_file_size(url))
     if remote_size > MAX_DL_SIZE:
         raise Exception(f"File too large: {human_size(remote_size)} (max {human_size(MAX_DL_SIZE)})")
 
-    tmp_free = shutil.disk_usage("/tmp").free
+    filename = await loop.run_in_executor(None, lambda: get_direct_filename(url))
+    ext      = Path(filename).suffix.lower()
+
+    size_str = f" ({human_size(remote_size)})" if remote_size else ""
+    await edit(f"📡 Streaming **{filename}**{size_str} → Telegram...")
+
+    # ── files ≤ 2 GB: stream into memory pipe, upload without touching disk ──
+    if remote_size <= MAX_FILE_SIZE:
+
+        class StreamingReader(io.RawIOBase):
+            """Wraps requests streaming response as a readable file-like object."""
+            def __init__(self):
+                self._resp  = HTTP.get(url, stream=True, timeout=(10, 300), allow_redirects=True)
+                self._resp.raise_for_status()
+                self._iter  = self._resp.iter_content(chunk_size=512 * 1024)
+                self._buf   = b""
+                self.uploaded = 0
+
+            def readable(self):
+                return True
+
+            def readinto(self, b):
+                if cancel.is_set():
+                    return 0          # signals EOF → Pyrogram/Telethon will stop
+                while not self._buf:
+                    try:
+                        self._buf = next(self._iter)
+                    except StopIteration:
+                        return 0      # EOF
+                n = min(len(b), len(self._buf))
+                b[:n] = self._buf[:n]
+                self._buf = self._buf[n:]
+                self.uploaded += n
+                return n
+
+            def close(self):
+                try: self._resp.close()
+                except Exception: pass
+                super().close()
+
+        reader = StreamingReader()
+        bio    = io.BufferedReader(reader, buffer_size=4 * 1024 * 1024)
+        bio.name = filename          # Pyrogram/Telethon read .name for file_name
+
+        await send_fn(bio, filename=filename, file_size=remote_size if remote_size else None)
+
+        if cancel.is_set():
+            raise asyncio.CancelledError()
+        return
+
+    # ── files > 2 GB: must save to disk first then split ──────────────────────
+    cleanup_stale_tmp()
+    tmp_free = get_tmp_free_bytes()
     if remote_size > 0 and remote_size > tmp_free:
         raise Exception(f"Not enough /tmp space. Need {human_size(remote_size)}, free {human_size(tmp_free)}")
-    filename  = await loop.run_in_executor(None, lambda: get_direct_filename(url))
-    dest_path = os.path.join(tmp_dir, filename)
-    await edit(f"⬇️ Downloading **{filename}**...")
-    cancel = get_cancel_event()
-    cancelled = [False]
 
+    dest_path  = os.path.join(tmp_dir, filename)
+    await edit(f"⬇️ Downloading **{filename}** to disk (>{human_size(MAX_FILE_SIZE)}, will split)...")
+
+    cancelled = [False]
     def _dl():
-        with HTTP.get(url, stream=True, timeout=60, allow_redirects=True) as r:
+        with HTTP.get(url, stream=True, timeout=(10, 300), allow_redirects=True) as r:
             r.raise_for_status()
             with open(dest_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
@@ -406,6 +489,7 @@ async def handle_direct(send_fn, edit, url, tmp_dir):
 async def handle_ytdlp(send_fn, edit, url, tmp_dir):
     if not check_cmd("yt-dlp"):
         raise Exception("yt-dlp not installed. Run: pip install yt-dlp")
+    cleanup_stale_tmp()
     await edit("🔍 Fetching media info...")
     loop = asyncio.get_running_loop()
     is_stream = any(urllib.parse.urlparse(url).path.lower().endswith(e) for e in STREAM_EXTS)
@@ -448,7 +532,7 @@ async def handle_ytdlp(send_fn, edit, url, tmp_dir):
 async def handle_magnet(send_fn, edit, magnet, tmp_dir):
     if not check_cmd("aria2c"):
         raise Exception("aria2c not installed. Run: apt install aria2")
-
+    cleanup_stale_tmp()
     await edit("🧲 Magnet download shuru ho raha hai...")
 
     RPC_PORT = 6800
@@ -642,22 +726,28 @@ def run_pyrogram():
                 except Exception:
                     pass
 
-        async def pg_send(client, message, status_msg, fp: Path):
-            ext     = fp.suffix.lower()
-            caption = f"✅ **{fp.name}**\n📦 {human_size(fp.stat().st_size)}"
+        async def pg_send(client, message, status_msg, fp, filename=None, file_size=None):
+            # fp can be a Path (disk file) or a file-like object (streaming)
+            is_path  = isinstance(fp, Path)
+            fname    = filename or (fp.name if is_path else "file")
+            ext      = Path(fname).suffix.lower()
+            fsize    = fp.stat().st_size if is_path else (file_size or 0)
+            caption  = f"✅ **{fname}**\n📦 {human_size(fsize)}" if fsize else f"✅ **{fname}**"
+            src      = str(fp) if is_path else fp
             kw = dict(
-                chat_id=message.chat.id, file_name=fp.name, caption=caption,
-                progress=pg_progress, progress_args=(status_msg, fp.name),
+                chat_id=message.chat.id, file_name=fname, caption=caption,
+                progress=pg_progress, progress_args=(status_msg, fname),
             )
             if ext in VIDEO_EXTS:
-                await client.send_video(video=str(fp), supports_streaming=True, **kw)
+                await client.send_video(video=src, supports_streaming=True, **kw)
             elif ext in AUDIO_EXTS:
-                await client.send_audio(audio=str(fp), **kw)
+                await client.send_audio(audio=src, **kw)
             else:
-                await client.send_document(document=str(fp), **kw)
-            try: fp.unlink()
-            except Exception: pass
-            logger.info(f"Sent {fp.name} | /tmp: {get_tmp_usage()}")
+                await client.send_document(document=src, **kw)
+            if is_path:
+                try: fp.unlink()
+                except Exception: pass
+            logger.info(f"Sent {fname} | /tmp: {get_tmp_usage()}")
             if status_msg:
                 try: await status_msg.delete()
                 except Exception: pass
@@ -714,12 +804,17 @@ def run_pyrogram():
                 await msg.reply_text("❓ Unsupported link. Use /help."); return
             lock = get_download_lock()
             if lock.locked():
-                await msg.reply_text("⏳ Another download in progress. Please wait."); return
+                wait_msg = await msg.reply_text("⏳ Another download in progress. You are queued — please wait...")
+                await lock.acquire()
+                try: await wait_msg.delete()
+                except Exception: pass
+            else:
+                await lock.acquire()
 
             status  = await msg.reply_text("⏳ Processing...")
             tmp_dir = tempfile.mkdtemp(dir="/tmp")
 
-            async def send_fn(fp): await pg_send(client, msg, status, fp)
+            async def send_fn(fp, **kw): await pg_send(client, msg, status, fp, **kw)
             async def edit(t):
                 try: await status.edit_text(t)
                 except Exception: pass
@@ -729,7 +824,7 @@ def run_pyrogram():
             cancel = get_cancel_event()
             cancel.clear()
             try:
-                async with lock:
+                if True:  # lock already acquired above
                     if   link_type == "gdrive_folder": await handle_gdrive_folder(send_fn, edit, identifier, tmp_dir)
                     elif link_type == "gdrive_file":   await handle_gdrive_file(send_fn, edit, identifier, tmp_dir)
                     elif link_type == "ytdlp":         await handle_ytdlp(send_fn, edit, identifier, tmp_dir)
@@ -746,6 +841,8 @@ def run_pyrogram():
                 cancel.clear()
                 _active_tmp_dir = None
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+                try: lock.release()
+                except RuntimeError: pass
                 logger.info(f"/tmp after cleanup: {get_tmp_usage()}")
 
         # ── start bot ────────────────────────────────────────────────────────
@@ -804,9 +901,13 @@ def run_telethon():
     workers = SETTINGS.get("workers", 4)
     bot     = TelegramClient("gdrive_bot_telethon", API_ID, API_HASH)
 
-    async def tl_send(client, chat_id, status_msg, fp: Path):
-        ext     = fp.suffix.lower()
-        caption = f"✅ **{fp.name}**\n📦 {human_size(fp.stat().st_size)}"
+    async def tl_send(client, chat_id, status_msg, fp, filename=None, file_size=None):
+        is_path = isinstance(fp, Path)
+        fname   = filename or (fp.name if is_path else "file")
+        ext     = Path(fname).suffix.lower()
+        fsize   = fp.stat().st_size if is_path else (file_size or 0)
+        caption = f"✅ **{fname}**\n📦 {human_size(fsize)}" if fsize else f"✅ **{fname}**"
+        src     = str(fp) if is_path else fp
         last    = [0.0]
 
         async def progress(sent, total):
@@ -814,19 +915,21 @@ def run_telethon():
             if now - last[0] < 4: return
             pct = sent * 100 // total if total else 0
             bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-            try: await status_msg.edit(f"📤 **{fp.name}**\n{bar} {pct}%"); last[0] = now
+            try: await status_msg.edit(f"📤 **{fname}**\n{bar} {pct}%"); last[0] = now
             except Exception: pass
 
         await client.send_file(
-            chat_id, str(fp), caption=caption,
+            chat_id, src, caption=caption,
+            attributes=[],
             supports_streaming=ext in VIDEO_EXTS,
             force_document=ext not in (VIDEO_EXTS | AUDIO_EXTS),
             part_size_kb=512,
             progress_callback=progress,
         )
-        try: fp.unlink()
-        except Exception: pass
-        logger.info(f"Sent {fp.name} | /tmp: {get_tmp_usage()}")
+        if is_path:
+            try: fp.unlink()
+            except Exception: pass
+        logger.info(f"Sent {fname} | /tmp: {get_tmp_usage()}")
         try: await status_msg.delete()
         except Exception: pass
 
@@ -880,13 +983,18 @@ def run_telethon():
             await event.reply("❓ Unsupported link. Use /help."); return
         lock = get_download_lock()
         if lock.locked():
-            await event.reply("⏳ Another download in progress. Please wait."); return
+            wait_msg = await event.reply("⏳ Another download in progress. You are queued — please wait...")
+            await lock.acquire()
+            try: await wait_msg.delete()
+            except Exception: pass
+        else:
+            await lock.acquire()
 
         status  = await event.reply("⏳ Processing...")
         tmp_dir = tempfile.mkdtemp(dir="/tmp")
         chat_id = event.chat_id
 
-        async def send_fn(fp): await tl_send(bot, chat_id, status, fp)
+        async def send_fn(fp, **kw): await tl_send(bot, chat_id, status, fp, **kw)
         async def edit(t):
             try: await status.edit(t)
             except Exception: pass
@@ -896,7 +1004,7 @@ def run_telethon():
         cancel = get_cancel_event()
         cancel.clear()
         try:
-            async with lock:
+            if True:  # lock already acquired above
                 if   link_type == "gdrive_folder": await handle_gdrive_folder(send_fn, edit, identifier, tmp_dir)
                 elif link_type == "gdrive_file":   await handle_gdrive_file(send_fn, edit, identifier, tmp_dir)
                 elif link_type == "ytdlp":         await handle_ytdlp(send_fn, edit, identifier, tmp_dir)
@@ -913,6 +1021,8 @@ def run_telethon():
             cancel.clear()
             _active_tmp_dir = None
             shutil.rmtree(tmp_dir, ignore_errors=True)
+            try: lock.release()
+            except RuntimeError: pass
             logger.info(f"/tmp after cleanup: {get_tmp_usage()}")
 
     async def _run():
