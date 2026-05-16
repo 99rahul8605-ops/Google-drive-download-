@@ -10,8 +10,6 @@ import urllib.parse
 import subprocess
 import time
 from pathlib import Path
-from aiohttp import web
-
 import gdown
 import requests
 
@@ -253,26 +251,41 @@ def auto_restart():
 
 
 async def run_health_server():
-    """Simple HTTP health server for Render port binding."""
-    async def health(request):
-        return web.Response(text="OK", status=200)
+    """Simple HTTP health server for Render port binding (pure asyncio, no aiohttp dependency)."""
 
-    async def home(request):
-        s = load_settings()
-        return web.Response(
-            text=f"Bot running | Engine: {s['library']} | Workers: {s['workers']}",
-            status=200
-        )
+    async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            data = await asyncio.wait_for(reader.read(1024), timeout=5)
+            request_line = data.decode(errors="ignore").split("\r\n")[0]
+            path = request_line.split(" ")[1] if len(request_line.split(" ")) > 1 else "/"
 
-    app = web.Application()
-    app.router.add_get("/", home)
-    app.router.add_get("/health", health)
+            if path == "/health":
+                body = "OK"
+            else:
+                s = load_settings()
+                body = f"Bot running | Engine: {s['library']} | Workers: {s['workers']}"
+
+            response = (
+                f"HTTP/1.1 200 OK\r\n"
+                f"Content-Type: text/plain\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+                f"{body}"
+            )
+            writer.write(response.encode())
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     port   = int(os.environ.get("PORT", 8080))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+    server = await asyncio.start_server(_handle_client, "0.0.0.0", port)
     logger.info(f"Health server running on port {port}")
 
 def check_cmd(name):
