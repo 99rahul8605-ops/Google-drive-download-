@@ -214,6 +214,19 @@ def human_size(b):
     if b < 1024**3: return f"{b/1024**2:.1f} MB"
     return f"{b/1024**3:.2f} GB"
 
+def progress_bar(current: int, total: int) -> str:
+    """Returns a unified progress line: bar + % + transferred/total + speed placeholder."""
+    pct = min(int(current * 100 / total), 100) if total else 0
+    filled = pct // 5          # 20-block bar (each block = 5%)
+    bar = "█" * filled + "░" * (20 - filled)
+    return f"{bar} {pct}%\n📥 {human_size(current)} / {human_size(total)}"
+
+def upload_bar(current: int, total: int) -> str:
+    pct = min(int(current * 100 / total), 100) if total else 0
+    filled = pct // 5
+    bar = "█" * filled + "░" * (20 - filled)
+    return f"{bar} {pct}%\n📤 {human_size(current)} / {human_size(total)}"
+
 def fix_filename(fp: Path) -> Path:
     if "." not in fp.name:
         ext = sniff_extension(str(fp))
@@ -454,15 +467,32 @@ async def handle_direct(send_fn, edit, url, tmp_dir):
 
         logger.info(f"[DIRECT] Stream start: {filename} size={human_size(remote_size) if remote_size else '?'} url={url}")
 
+        _dl_last_edit = [0.0]
+
+        async def _update_dl_progress(transferred: int):
+            """Edit status message with download progress (max once per 3s)."""
+            now = time.time()
+            if now - _dl_last_edit[0] < 3:
+                return
+            _dl_last_edit[0] = now
+            try:
+                if remote_size:
+                    line = progress_bar(transferred, remote_size)
+                    await edit(f"⬇️ **{filename}**\n{line}")
+                else:
+                    await edit(f"⬇️ **{filename}**\n📥 {human_size(transferred)}")
+            except Exception:
+                pass
+
         class LoggingReader(io.RawIOBase):
-            """Wraps requests streaming response with progress logging."""
+            """Wraps requests streaming response with Telegram progress updates."""
             def __init__(self):
                 self._resp     = HTTP.get(url, stream=True, timeout=(10, 300), allow_redirects=True)
                 self._resp.raise_for_status()
                 self._iter     = self._resp.iter_content(chunk_size=512 * 1024)
                 self._buf      = b""
                 self.uploaded  = 0
-                self._last_log = 0
+                self._loop     = asyncio.get_event_loop()
 
             def readable(self): return True
 
@@ -479,11 +509,7 @@ async def handle_direct(send_fn, edit, url, tmp_dir):
                 b[:n] = self._buf[:n]
                 self._buf = self._buf[n:]
                 self.uploaded += n
-                # log every 10 MB
-                if self.uploaded - self._last_log >= 10 * 1024 * 1024:
-                    pct = f"{self.uploaded*100//remote_size}%" if remote_size else "?"
-                    logger.info(f"[DIRECT] Streaming {filename}: {human_size(self.uploaded)} / {human_size(remote_size) if remote_size else '?'} ({pct})")
-                    self._last_log = self.uploaded
+                asyncio.run_coroutine_threadsafe(_update_dl_progress(self.uploaded), self._loop)
                 return n
 
             def close(self):
@@ -520,24 +546,37 @@ async def handle_direct(send_fn, edit, url, tmp_dir):
     await edit(f"⬇️ Downloading **{filename}** to disk (>{human_size(MAX_FILE_SIZE)}, will split)...")
 
     logger.info(f"[DIRECT] Disk download start: {filename} size={human_size(remote_size) if remote_size else '?'}")
-    cancelled = [False]
+    cancelled  = [False]
+    _disk_last = [0.0]
+
+    async def _update_disk_progress(downloaded: int):
+        now = time.time()
+        if now - _disk_last[0] < 3:
+            return
+        _disk_last[0] = now
+        try:
+            if remote_size:
+                line = progress_bar(downloaded, remote_size)
+                await edit(f"⬇️ **{filename}**\n{line}")
+            else:
+                await edit(f"⬇️ **{filename}**\n📥 {human_size(downloaded)}")
+        except Exception:
+            pass
+
+    _disk_loop = asyncio.get_running_loop()
     def _dl():
         downloaded = 0
-        last_log   = 0
         with HTTP.get(url, stream=True, timeout=(10, 300), allow_redirects=True) as r:
             r.raise_for_status()
             with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
                     if cancel.is_set():
                         cancelled[0] = True
                         return
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
-                        if downloaded - last_log >= 50 * 1024 * 1024:
-                            pct = f"{downloaded*100//remote_size}%" if remote_size else "?"
-                            logger.info(f"[DIRECT] Downloaded {human_size(downloaded)} / {human_size(remote_size) if remote_size else '?'} ({pct})")
-                            last_log = downloaded
+                        asyncio.run_coroutine_threadsafe(_update_disk_progress(downloaded), _disk_loop)
         logger.info(f"[DIRECT] Disk download complete: {filename} total={human_size(downloaded)}")
     await loop.run_in_executor(None, _dl)
     if cancelled[0]:
@@ -866,15 +905,19 @@ def run_pyrogram():
 
         # ── progress & send helpers ───────────────────────────────────────────
 
+        _pg_prog_last: dict = {}
         async def pg_progress(current, total, status_msg, filename):
             if total == 0 or status_msg is None: return
-            pct = current * 100 // total
-            if pct in (0, 25, 50, 75, 100):
-                try:
-                    bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-                    await status_msg.edit_text(f"📤 **{filename}**\n{bar} {pct}%")
-                except Exception:
-                    pass
+            now = time.time()
+            key = id(status_msg)
+            if now - _pg_prog_last.get(key, 0.0) < 3:
+                return
+            _pg_prog_last[key] = now
+            try:
+                line = upload_bar(current, total)
+                await status_msg.edit_text(f"📤 **{filename}**\n{line}")
+            except Exception:
+                pass
 
         async def pg_send(client, message, status_msg, fp, filename=None, file_size=None):
             # fp can be a Path (disk file) or a file-like object (streaming)
@@ -1107,14 +1150,15 @@ def run_telethon():
         fsize   = fp.stat().st_size if is_path else (file_size or 0)
         caption = f"✅ **{fname}**\n📦 {human_size(fsize)}" if fsize else f"✅ **{fname}**"
         src     = str(fp) if is_path else fp
-        last    = [0.0]
+        _tl_last = [0.0]
 
         async def progress(sent, total):
             now = time.time()
-            if now - last[0] < 4: return
-            pct = sent * 100 // total if total else 0
-            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-            try: await status_msg.edit(f"📤 **{fname}**\n{bar} {pct}%"); last[0] = now
+            if now - _tl_last[0] < 3: return
+            _tl_last[0] = now
+            try:
+                line = upload_bar(sent, total) if total else f"📤 {human_size(sent)}"
+                await status_msg.edit(f"📤 **{fname}**\n{line}")
             except Exception: pass
 
         # For video files: buffer stream to disk if needed (send_file may seek),
@@ -1124,24 +1168,45 @@ def run_telethon():
 
         actual_src  = src
         tmp_vid_tl  = None
+        import asyncio as _aio
+
+        # Telethon's send_file() cannot stream from a non-seekable file-like object —
+        # it reads the whole thing into memory. Always buffer to disk first to avoid OOM.
+        if not is_path:
+            _t = _tf2.NamedTemporaryFile(delete=False, suffix=ext, dir="/tmp")
+            _buf_last  = [0.0]
+            _buf_total = file_size or 0
+            _buf_written = [0]
+
+            async def _update_buf_progress(written: int):
+                now = time.time()
+                if now - _buf_last[0] < 3: return
+                _buf_last[0] = now
+                try:
+                    if _buf_total:
+                        line = progress_bar(written, _buf_total)
+                        await status_msg.edit(f"⬇️ **{fname}**\n{line}")
+                    else:
+                        await status_msg.edit(f"⬇️ **{fname}**\n📥 {human_size(written)}")
+                except Exception: pass
+
+            _buf_loop = _aio.get_running_loop()
+            def _buf_tl():
+                while True:
+                    chunk = fp.read(4 * 1024 * 1024)   # 4 MB chunks — low RAM footprint
+                    if not chunk: break
+                    _t.write(chunk)
+                    _buf_written[0] += len(chunk)
+                    asyncio.run_coroutine_threadsafe(_update_buf_progress(_buf_written[0]), _buf_loop)
+                _t.flush()
+            await _aio.get_running_loop().run_in_executor(None, _buf_tl)
+            _t.close()
+            tmp_vid_tl = _t.name
+            actual_src = tmp_vid_tl
 
         if ext in VIDEO_EXTS:
             if not is_path:
-                # Stream is not seekable — buffer to a temp file first
-                try: await status_msg.edit(f"⬇️ Buffering **{fname}** for upload...")
-                except Exception: pass
-                _t = _tf2.NamedTemporaryFile(delete=False, suffix=ext, dir="/tmp")
-                def _buf_tl():
-                    while True:
-                        chunk = fp.read(4 * 1024 * 1024)
-                        if not chunk: break
-                        _t.write(chunk)
-                    _t.flush()
-                import asyncio as _aio
-                await _aio.get_running_loop().run_in_executor(None, _buf_tl)
-                _t.close()
-                tmp_vid_tl  = _t.name
-                actual_src  = tmp_vid_tl
+                pass  # already buffered above
 
             # Add silent audio track if missing — prevents GIF conversion
             _fixed_tl  = await _aio.get_running_loop().run_in_executor(None, ensure_audio_track, actual_src)
