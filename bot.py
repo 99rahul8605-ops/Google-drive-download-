@@ -559,7 +559,19 @@ async def handle_ytdlp(send_fn, edit, url, tmp_dir):
     outtmpl   = os.path.join(tmp_dir, "stream_%(id)s.%(ext)s" if is_stream else "%(title).60s.%(ext)s")
     cmd = [
         "yt-dlp", "--no-playlist",
-        "-f", f"bestvideo[ext=mp4][filesize<{MAX_DL_SIZE}]+bestaudio[ext=m4a]/best[ext=mp4][filesize<{MAX_DL_SIZE}]/best",
+        # Format priority:
+        # 1. Best mp4 video + best m4a audio (merged)        — ideal quality
+        # 2. Best video + best audio (any ext, merged)       — fallback merge
+        # 3. Best single file that already has audio         — pre-muxed
+        # 4. Absolute best available                         — last resort
+        # NOTE: avoid filesize filters — Instagram/TikTok don't report sizes in
+        # manifests, causing filesize< filters to silently drop audio streams.
+        "-f", (
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/"
+            "best[acodec!=none]/"
+            "best"
+        ),
         "--merge-output-format", "mp4",
         "--max-filesize", str(MAX_DL_SIZE),
         "--output", outtmpl, "--no-warnings", "--hls-prefer-ffmpeg", url,
