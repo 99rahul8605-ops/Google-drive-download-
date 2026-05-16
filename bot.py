@@ -262,45 +262,32 @@ def auto_restart():
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
+def start_health_server():
+    """Flask health server in a background daemon thread."""
+    from flask import Flask
+    flask_app = Flask(__name__)
+
+    @flask_app.route("/")
+    def home():
+        s = load_settings()
+        return f"Bot running | Engine: {s['library']} | Workers: {s['workers']}", 200
+
+    @flask_app.route("/health")
+    def health():
+        return "OK", 200
+
+    port = int(os.environ.get("PORT", 8080))
+    import threading
+    t = threading.Thread(
+        target=lambda: flask_app.run(host="0.0.0.0", port=port, use_reloader=False),
+        daemon=True,
+    )
+    t.start()
+    logger.info(f"Flask health server started on port {port}")
+
 async def run_health_server():
-    """Simple HTTP health server for Render port binding (pure asyncio, no aiohttp dependency)."""
-
-    async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        try:
-            data = await asyncio.wait_for(reader.read(1024), timeout=5)
-            request_line = data.decode(errors="ignore").split("\r\n")[0]
-            path = request_line.split(" ")[1] if len(request_line.split(" ")) > 1 else "/"
-
-            if path == "/health":
-                body = "OK"
-            else:
-                s = load_settings()
-                body = f"Bot running | Engine: {s['library']} | Workers: {s['workers']}"
-
-            response = (
-                f"HTTP/1.1 200 OK\r\n"
-                f"Content-Type: text/plain\r\n"
-                f"Content-Length: {len(body)}\r\n"
-                f"Connection: close\r\n"
-                f"\r\n"
-                f"{body}"
-            )
-            writer.write(response.encode())
-            await writer.drain()
-        except Exception:
-            pass
-        finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-    port   = int(os.environ.get("PORT", 8080))
-    server = await asyncio.start_server(_handle_client, "0.0.0.0", port, start_serving=True)
-    logger.info(f"Health server running on port {port}")
-    # keep server reference alive so GC doesn't close it
-    asyncio.get_running_loop().bot_health_server = server
+    """Async wrapper — starts Flask in background thread (non-blocking)."""
+    start_health_server()
 
 def check_cmd(name):
     try:
@@ -590,115 +577,122 @@ async def handle_set_cmd(parts, reply_fn):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def run_pyrogram():
+    import signal
     from pyrogram import Client, filters
     from pyrogram.types import Message
 
-    workers = SETTINGS.get("workers", 4)
-    bot = Client(
-        "gdrive_bot_pyrogram",
-        api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
-        workers=workers,
-        max_concurrent_transmissions=workers,
-    )
-
-    async def pg_progress(current, total, status_msg, filename):
-        if total == 0 or status_msg is None: return
-        pct = current * 100 // total
-        if pct in (0, 50, 100):
-            try:
-                bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-                await status_msg.edit_text(f"📤 **{filename}**\n{bar} {pct}%")
-            except Exception:
-                pass
-
-    async def pg_send(client, message, status_msg, fp: Path):
-        ext     = fp.suffix.lower()
-        caption = f"✅ **{fp.name}**\n📦 {human_size(fp.stat().st_size)}"
-        kw = dict(
-            chat_id=message.chat.id, file_name=fp.name, caption=caption,
-            progress=pg_progress, progress_args=(status_msg, fp.name),
-        )
-        if ext in VIDEO_EXTS:
-            await client.send_video(video=str(fp), supports_streaming=True, **kw)
-        elif ext in AUDIO_EXTS:
-            await client.send_audio(audio=str(fp), **kw)
-        else:
-            await client.send_document(document=str(fp), **kw)
-        try: fp.unlink()
-        except Exception: pass
-        logger.info(f"Sent {fp.name} | /tmp: {get_tmp_usage()}")
-        if status_msg:
-            try: await status_msg.delete()
-            except Exception: pass
-
-    @bot.on_message(filters.command("start"))
-    async def start(_, msg: Message):
-        await msg.reply_text(
-            f"👋 **Universal Downloader Bot**\n"
-            f"🔧 Engine: `Pyrogram` | Workers: `{workers}`\n\n"
-            f"✅ Google Drive • Direct links • YouTube/Instagram/TikTok/etc • Magnets\n"
-            f"/help — usage | /settings — config"
-        )
-
-    @bot.on_message(filters.command("help"))
-    async def help_cmd(_, msg: Message):
-        await msg.reply_text(
-            "📖 **Supported links:**\n\n"
-            "• Google Drive (file/folder)\n"
-            "• Direct HTTP/HTTPS file links\n"
-            "• YouTube, Instagram, Twitter/X, TikTok + 1000 more (yt-dlp)\n"
-            "• `.m3u8` / HLS streams\n"
-            "• Magnet links (aria2c required)\n\n"
-            "⚠️ Max 2 GB | One download at a time"
-        )
-
-    @bot.on_message(filters.command("settings"))
-    async def settings_cmd(_, msg: Message):
-        await msg.reply_text(settings_text())
-
-    @bot.on_message(filters.command("set"))
-    async def set_cmd(_, msg: Message):
-        parts = msg.text.strip().split()
-        await handle_set_cmd(parts, msg.reply_text)
-
-    @bot.on_message(filters.text & ~filters.command(["start", "help", "settings", "set"]))
-    async def handle_message(client, msg: Message):
-        if not msg.text:
-            return
-        text = msg.text.strip()
-        identifier, link_type = detect_link_type(text)
-        if link_type == "unknown" or not identifier:
-            await msg.reply_text("❓ Unsupported link. Use /help."); return
-        lock = get_download_lock()
-        if lock.locked():
-            await msg.reply_text("⏳ Another download in progress. Please wait."); return
-
-        status  = await msg.reply_text("⏳ Processing...")
-        tmp_dir = tempfile.mkdtemp(dir="/tmp")
-
-        async def send_fn(fp): await pg_send(client, msg, status, fp)
-        async def edit(t):
-            try: await status.edit_text(t)
-            except Exception: pass
-
-        try:
-            async with lock:
-                if   link_type == "gdrive_folder": await handle_gdrive_folder(send_fn, edit, identifier, tmp_dir)
-                elif link_type == "gdrive_file":   await handle_gdrive_file(send_fn, edit, identifier, tmp_dir)
-                elif link_type == "ytdlp":         await handle_ytdlp(send_fn, edit, identifier, tmp_dir)
-                elif link_type == "direct":        await handle_direct(send_fn, edit, identifier, tmp_dir)
-                elif link_type == "magnet":        await handle_magnet(send_fn, edit, identifier, tmp_dir)
-        except Exception as e:
-            logger.error(f"Error: {e}", exc_info=True)
-            try: await status.edit_text(f"❌ **Error:** {e}")
-            except Exception: pass
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            logger.info(f"/tmp after cleanup: {get_tmp_usage()}")
-
-    logger.info("Starting with Pyrogram...")
-
     async def main():
+        workers = SETTINGS.get("workers", 4)
+
+        # Client MUST be created inside the running event loop
+        bot = Client(
+            "gdrive_bot_pyrogram",
+            api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
+            workers=workers,
+            max_concurrent_transmissions=workers,
+        )
+
+        # ── progress & send helpers ───────────────────────────────────────────
+
+        async def pg_progress(current, total, status_msg, filename):
+            if total == 0 or status_msg is None: return
+            pct = current * 100 // total
+            if pct in (0, 25, 50, 75, 100):
+                try:
+                    bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+                    await status_msg.edit_text(f"📤 **{filename}**\n{bar} {pct}%")
+                except Exception:
+                    pass
+
+        async def pg_send(client, message, status_msg, fp: Path):
+            ext     = fp.suffix.lower()
+            caption = f"✅ **{fp.name}**\n📦 {human_size(fp.stat().st_size)}"
+            kw = dict(
+                chat_id=message.chat.id, file_name=fp.name, caption=caption,
+                progress=pg_progress, progress_args=(status_msg, fp.name),
+            )
+            if ext in VIDEO_EXTS:
+                await client.send_video(video=str(fp), supports_streaming=True, **kw)
+            elif ext in AUDIO_EXTS:
+                await client.send_audio(audio=str(fp), **kw)
+            else:
+                await client.send_document(document=str(fp), **kw)
+            try: fp.unlink()
+            except Exception: pass
+            logger.info(f"Sent {fp.name} | /tmp: {get_tmp_usage()}")
+            if status_msg:
+                try: await status_msg.delete()
+                except Exception: pass
+
+        # ── handlers ─────────────────────────────────────────────────────────
+
+        @bot.on_message(filters.command("start"))
+        async def start(_, msg: Message):
+            await msg.reply_text(
+                f"👋 **Universal Downloader Bot**\n"
+                f"🔧 Engine: `Pyrogram` | Workers: `{workers}`\n\n"
+                f"✅ Google Drive • Direct links • YouTube/Instagram/TikTok/etc • Magnets\n"
+                f"/help — usage | /settings — config"
+            )
+
+        @bot.on_message(filters.command("help"))
+        async def help_cmd(_, msg: Message):
+            await msg.reply_text(
+                "📖 **Supported links:**\n\n"
+                "• Google Drive (file/folder)\n"
+                "• Direct HTTP/HTTPS file links\n"
+                "• YouTube, Instagram, Twitter/X, TikTok + 1000 more (yt-dlp)\n"
+                "• `.m3u8` / HLS streams\n"
+                "• Magnet links (aria2c required)\n\n"
+                "⚠️ Max 2 GB | One download at a time"
+            )
+
+        @bot.on_message(filters.command("settings"))
+        async def settings_cmd(_, msg: Message):
+            await msg.reply_text(settings_text())
+
+        @bot.on_message(filters.command("set"))
+        async def set_cmd(_, msg: Message):
+            parts = msg.text.strip().split()
+            await handle_set_cmd(parts, msg.reply_text)
+
+        @bot.on_message(filters.text & ~filters.command(["start", "help", "settings", "set"]))
+        async def handle_message(client, msg: Message):
+            if not msg.text:
+                return
+            text = msg.text.strip()
+            identifier, link_type = detect_link_type(text)
+            if link_type == "unknown" or not identifier:
+                await msg.reply_text("❓ Unsupported link. Use /help."); return
+            lock = get_download_lock()
+            if lock.locked():
+                await msg.reply_text("⏳ Another download in progress. Please wait."); return
+
+            status  = await msg.reply_text("⏳ Processing...")
+            tmp_dir = tempfile.mkdtemp(dir="/tmp")
+
+            async def send_fn(fp): await pg_send(client, msg, status, fp)
+            async def edit(t):
+                try: await status.edit_text(t)
+                except Exception: pass
+
+            try:
+                async with lock:
+                    if   link_type == "gdrive_folder": await handle_gdrive_folder(send_fn, edit, identifier, tmp_dir)
+                    elif link_type == "gdrive_file":   await handle_gdrive_file(send_fn, edit, identifier, tmp_dir)
+                    elif link_type == "ytdlp":         await handle_ytdlp(send_fn, edit, identifier, tmp_dir)
+                    elif link_type == "direct":        await handle_direct(send_fn, edit, identifier, tmp_dir)
+                    elif link_type == "magnet":        await handle_magnet(send_fn, edit, identifier, tmp_dir)
+            except Exception as e:
+                logger.error(f"Error: {e}", exc_info=True)
+                try: await status.edit_text(f"❌ **Error:** {e}")
+                except Exception: pass
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                logger.info(f"/tmp after cleanup: {get_tmp_usage()}")
+
+        # ── start bot ────────────────────────────────────────────────────────
+
         await run_health_server()
         await bot.start()
         logger.info("Pyrogram bot started and listening...")
@@ -720,7 +714,6 @@ def run_pyrogram():
             except Exception as e:
                 logger.warning(f"Startup msg failed: {e}")
 
-        # Keep running until interrupted — no pyrogram idle() needed
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
 
@@ -728,16 +721,16 @@ def run_pyrogram():
             logger.info("Shutdown signal received")
             stop_event.set()
 
-        import signal
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, _sig_handler)
             except (NotImplementedError, RuntimeError):
-                pass  # Windows or restricted env
+                pass
 
         await stop_event.wait()
         await bot.stop()
 
+    logger.info("Starting with Pyrogram...")
     asyncio.run(main())
 
 
