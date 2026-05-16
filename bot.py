@@ -555,27 +555,43 @@ async def handle_ytdlp(send_fn, edit, url, tmp_dir):
     logger.info(f"[YTDLP] Download start: {url}")
     await edit("🔍 Fetching media info...")
     loop = asyncio.get_running_loop()
-    is_stream = any(urllib.parse.urlparse(url).path.lower().endswith(e) for e in STREAM_EXTS)
-    outtmpl   = os.path.join(tmp_dir, "stream_%(id)s.%(ext)s" if is_stream else "%(title).60s.%(ext)s")
+    is_stream    = any(urllib.parse.urlparse(url).path.lower().endswith(e) for e in STREAM_EXTS)
+    is_instagram = "instagram.com" in url or "instagr.am" in url
+    outtmpl      = os.path.join(tmp_dir, "stream_%(id)s.%(ext)s" if is_stream else "%(title).60s.%(ext)s")
+
+    # Format priority:
+    # 1. Best mp4 video + best m4a audio (merged)              — ideal
+    # 2. Best mp4 video + any best audio                       — common Instagram fallback
+    # 3. Best video + best m4a audio                           — cross-format merge
+    # 4. Best video + any audio                                — generic merge
+    # 5. Pre-muxed file with both streams                      — Reels/small clips
+    # 6. Best file with audio codec                            — last resort with audio
+    # 7. Absolute best                                         — no audio filter
+    # NOTE: avoid filesize filters — Instagram/TikTok don't report sizes in manifests.
+    fmt = (
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+        "bestvideo[ext=mp4]+bestaudio/"
+        "bestvideo+bestaudio[ext=m4a]/"
+        "bestvideo+bestaudio/"
+        "best[acodec!=none][vcodec!=none]/"
+        "best[acodec!=none]/"
+        "best"
+    )
     cmd = [
         "yt-dlp", "--no-playlist",
-        # Format priority:
-        # 1. Best mp4 video + best m4a audio (merged)        — ideal quality
-        # 2. Best video + best audio (any ext, merged)       — fallback merge
-        # 3. Best single file that already has audio         — pre-muxed
-        # 4. Absolute best available                         — last resort
-        # NOTE: avoid filesize filters — Instagram/TikTok don't report sizes in
-        # manifests, causing filesize< filters to silently drop audio streams.
-        "-f", (
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo+bestaudio/"
-            "best[acodec!=none]/"
-            "best"
-        ),
+        "-f", fmt,
         "--merge-output-format", "mp4",
         "--max-filesize", str(MAX_DL_SIZE),
-        "--output", outtmpl, "--no-warnings", "--hls-prefer-ffmpeg", url,
+        "--output", outtmpl, "--no-warnings", "--hls-prefer-ffmpeg",
     ]
+    if is_instagram:
+        # Instagram small Reels often come as a single muxed stream —
+        # using a mobile UA makes the API return proper muxed mp4 with audio.
+        cmd += [
+            "--add-header",
+            "User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        ]
+    cmd.append(url)
     await edit("⬇️ Downloading stream..." if is_stream else "⬇️ Downloading via yt-dlp...")
     cancel = get_cancel_event()
     proc_holder = [None]
