@@ -10,6 +10,7 @@ import urllib.parse
 import subprocess
 import time
 from pathlib import Path
+from aiohttp import web
 
 import gdown
 import requests
@@ -249,6 +250,30 @@ def auto_restart():
     """Restart the bot process with same arguments."""
     logger.info("Restarting bot...")
     os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+async def run_health_server():
+    """Simple HTTP health server for Render port binding."""
+    async def health(request):
+        return web.Response(text="OK", status=200)
+
+    async def home(request):
+        s = load_settings()
+        return web.Response(
+            text=f"Bot running | Engine: {s['library']} | Workers: {s['workers']}",
+            status=200
+        )
+
+    app = web.Application()
+    app.router.add_get("/", home)
+    app.router.add_get("/health", health)
+
+    port   = int(os.environ.get("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health server running on port {port}")
 
 def check_cmd(name):
     try:
@@ -644,9 +669,9 @@ def run_pyrogram():
     logger.info("Starting with Pyrogram...")
 
     async def main():
+        await run_health_server()
         await bot.start()
 
-        # Startup message
         if OWNER_ID:
             s   = load_settings()
             txt = (
@@ -773,6 +798,7 @@ def run_telethon():
             logger.info(f"/tmp after cleanup: {get_tmp_usage()}")
 
     async def _run():
+        await run_health_server()
         await bot.start(bot_token=BOT_TOKEN)
         logger.info("Starting with Telethon...")
 
