@@ -82,6 +82,8 @@ AUDIO_EXTS     = {".mp3", ".m4a", ".ogg", ".flac", ".wav", ".aac", ".opus"}
 HTTP             = requests.Session()
 HTTP.headers.update({"User-Agent": "Mozilla/5.0"})
 _download_lock: asyncio.Lock | None = None
+_cancel_event:  asyncio.Event | None = None
+_active_tmp_dir: str | None = None   # track current download tmp dir for cleanup
 
 def get_download_lock() -> asyncio.Lock:
     """Always return a Lock tied to the current running event loop."""
@@ -90,10 +92,20 @@ def get_download_lock() -> asyncio.Lock:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
-    # Re-create if no lock yet, or if the existing lock belongs to a different loop
     if _download_lock is None or getattr(_download_lock, "_loop", None) is not loop:
         _download_lock = asyncio.Lock()
     return _download_lock
+
+def get_cancel_event() -> asyncio.Event:
+    """Always return a cancel Event tied to the current running event loop."""
+    global _cancel_event
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if _cancel_event is None or getattr(_cancel_event, "_loop", None) is not loop:
+        _cancel_event = asyncio.Event()
+    return _cancel_event
 
 
 # ── Link detection ────────────────────────────────────────────────────────────
@@ -325,6 +337,7 @@ async def handle_gdrive_file(send_fn, edit, file_id, tmp_dir):
             output=tmp_dir + "/", quiet=False, fuzzy=True
         )
     )
+    if get_cancel_event().is_set(): raise asyncio.CancelledError()
     if not downloaded or not os.path.exists(downloaded):
         raise Exception("Download failed. File may be private.")
     fp = Path(downloaded)
@@ -369,13 +382,21 @@ async def handle_direct(send_fn, edit, url, tmp_dir):
     filename  = await loop.run_in_executor(None, lambda: get_direct_filename(url))
     dest_path = os.path.join(tmp_dir, filename)
     await edit(f"⬇️ Downloading **{filename}**...")
+    cancel = get_cancel_event()
+    cancelled = [False]
+
     def _dl():
         with HTTP.get(url, stream=True, timeout=60, allow_redirects=True) as r:
             r.raise_for_status()
             with open(dest_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                    if cancel.is_set():
+                        cancelled[0] = True
+                        return
                     if chunk: f.write(chunk)
     await loop.run_in_executor(None, _dl)
+    if cancelled[0]:
+        raise asyncio.CancelledError()
     fp = fix_filename(Path(dest_path))
     if not fp.exists():
         raise Exception("Download failed.")
@@ -397,10 +418,27 @@ async def handle_ytdlp(send_fn, edit, url, tmp_dir):
         "--output", outtmpl, "--no-warnings", "--hls-prefer-ffmpeg", url,
     ]
     await edit("⬇️ Downloading stream..." if is_stream else "⬇️ Downloading via yt-dlp...")
+    cancel = get_cancel_event()
+    proc_holder = [None]
+
     def _run():
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if r.returncode != 0: raise Exception(r.stderr.strip() or "yt-dlp failed.")
-    await loop.run_in_executor(None, _run)
+        proc_holder[0] = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        _, stderr = proc_holder[0].communicate()
+        if cancel.is_set():
+            return
+        if proc_holder[0].returncode != 0:
+            raise Exception(stderr.strip() or "yt-dlp failed.")
+
+    fut = loop.run_in_executor(None, _run)
+    while not fut.done():
+        if cancel.is_set():
+            try:
+                if proc_holder[0]: proc_holder[0].terminate()
+            except Exception: pass
+            raise asyncio.CancelledError()
+        await asyncio.sleep(1)
+    fut.result()  # re-raise any exception from _run
+    if cancel.is_set(): raise asyncio.CancelledError()
     files = [f for f in Path(tmp_dir).iterdir() if f.is_file()]
     if not files: raise Exception("yt-dlp: no output file created.")
     for fp in sorted(files, key=lambda f: f.stat().st_size, reverse=True):
@@ -644,7 +682,8 @@ def run_pyrogram():
                 "• YouTube, Instagram, Twitter/X, TikTok + 1000 more (yt-dlp)\n"
                 "• `.m3u8` / HLS streams\n"
                 "• Magnet links (aria2c required)\n\n"
-                "⚠️ Max 2 GB | One download at a time"
+                "⚠️ Max 2 GB | One download at a time\n"
+                "/cancel — stop current download"
             )
 
         @bot.on_message(filters.command("settings"))
@@ -656,7 +695,16 @@ def run_pyrogram():
             parts = msg.text.strip().split()
             await handle_set_cmd(parts, msg.reply_text)
 
-        @bot.on_message(filters.text & ~filters.command(["start", "help", "settings", "set"]))
+        @bot.on_message(filters.command("cancel"))
+        async def cancel_cmd(_, msg: Message):
+            lock = get_download_lock()
+            if not lock.locked():
+                await msg.reply_text("ℹ️ No download is currently running.")
+                return
+            get_cancel_event().set()
+            await msg.reply_text("🚫 Cancel signal sent. Download will stop shortly...")
+
+        @bot.on_message(filters.text & ~filters.command(["start", "help", "settings", "set", "cancel"]))
         async def handle_message(client, msg: Message):
             if not msg.text:
                 return
@@ -676,6 +724,10 @@ def run_pyrogram():
                 try: await status.edit_text(t)
                 except Exception: pass
 
+            global _active_tmp_dir
+            _active_tmp_dir = tmp_dir
+            cancel = get_cancel_event()
+            cancel.clear()
             try:
                 async with lock:
                     if   link_type == "gdrive_folder": await handle_gdrive_folder(send_fn, edit, identifier, tmp_dir)
@@ -683,11 +735,16 @@ def run_pyrogram():
                     elif link_type == "ytdlp":         await handle_ytdlp(send_fn, edit, identifier, tmp_dir)
                     elif link_type == "direct":        await handle_direct(send_fn, edit, identifier, tmp_dir)
                     elif link_type == "magnet":        await handle_magnet(send_fn, edit, identifier, tmp_dir)
+            except asyncio.CancelledError:
+                try: await status.edit_text("🚫 Download cancelled.")
+                except Exception: pass
             except Exception as e:
                 logger.error(f"Error: {e}", exc_info=True)
                 try: await status.edit_text(f"❌ **Error:** {e}")
                 except Exception: pass
             finally:
+                cancel.clear()
+                _active_tmp_dir = None
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 logger.info(f"/tmp after cleanup: {get_tmp_usage()}")
 
@@ -791,7 +848,8 @@ def run_telethon():
             "• YouTube, Instagram, Twitter/X, TikTok + 1000 more (yt-dlp)\n"
             "• `.m3u8` / HLS streams\n"
             "• Magnet links (aria2c required)\n\n"
-            "⚠️ Max 2 GB | One download at a time"
+            "⚠️ Max 2 GB | One download at a time\n"
+            "/cancel — stop current download"
         )
 
     @bot.on(events.NewMessage(pattern="/settings"))
@@ -802,6 +860,15 @@ def run_telethon():
     async def set_cmd(event):
         parts = event.raw_text.strip().split()
         await handle_set_cmd(parts, event.reply)
+
+    @bot.on(events.NewMessage(pattern="/cancel"))
+    async def cancel_cmd(event):
+        lock = get_download_lock()
+        if not lock.locked():
+            await event.reply("ℹ️ No download is currently running.")
+            return
+        get_cancel_event().set()
+        await event.reply("🚫 Cancel signal sent. Download will stop shortly...")
 
     @bot.on(events.NewMessage())
     async def handle_message(event):
@@ -824,6 +891,10 @@ def run_telethon():
             try: await status.edit(t)
             except Exception: pass
 
+        global _active_tmp_dir
+        _active_tmp_dir = tmp_dir
+        cancel = get_cancel_event()
+        cancel.clear()
         try:
             async with lock:
                 if   link_type == "gdrive_folder": await handle_gdrive_folder(send_fn, edit, identifier, tmp_dir)
@@ -831,11 +902,16 @@ def run_telethon():
                 elif link_type == "ytdlp":         await handle_ytdlp(send_fn, edit, identifier, tmp_dir)
                 elif link_type == "direct":        await handle_direct(send_fn, edit, identifier, tmp_dir)
                 elif link_type == "magnet":        await handle_magnet(send_fn, edit, identifier, tmp_dir)
+        except asyncio.CancelledError:
+            try: await status.edit("🚫 Download cancelled.")
+            except Exception: pass
         except Exception as e:
             logger.error(f"Error: {e}", exc_info=True)
             try: await status.edit(f"❌ **Error:** {e}")
             except Exception: pass
         finally:
+            cancel.clear()
+            _active_tmp_dir = None
             shutil.rmtree(tmp_dir, ignore_errors=True)
             logger.info(f"/tmp after cleanup: {get_tmp_usage()}")
 
