@@ -81,6 +81,7 @@ AUDIO_EXTS     = {".mp3", ".m4a", ".ogg", ".flac", ".wav", ".aac", ".opus"}
 
 HTTP             = requests.Session()
 HTTP.headers.update({"User-Agent": "Mozilla/5.0"})
+BOT_START_TIME   = time.time()   # used to skip stale messages on startup
 _download_lock: asyncio.Lock | None = None
 _cancel_event:  asyncio.Event | None = None
 _active_tmp_dir: str | None = None   # track current download tmp dir for cleanup
@@ -490,9 +491,17 @@ async def handle_direct(send_fn, edit, url, tmp_dir):
                 except Exception: pass
                 super().close()
 
+        class NamedBufferedReader(io.BufferedReader):
+            """BufferedReader with a writable .name property (io.BufferedReader.name is read-only)."""
+            @property
+            def name(self):
+                return self._name
+            def __init__(self, raw, buffer_size, name):
+                super().__init__(raw, buffer_size=buffer_size)
+                self._name = name
+
         reader = LoggingReader()
-        bio    = io.BufferedReader(reader, buffer_size=4 * 1024 * 1024)
-        bio.name = filename
+        bio    = NamedBufferedReader(reader, buffer_size=4 * 1024 * 1024, name=filename)
 
         await send_fn(bio, filename=filename, file_size=remote_size if remote_size else None)
         logger.info(f"[DIRECT] Stream upload done: {filename}")
@@ -851,9 +860,12 @@ def run_pyrogram():
             get_cancel_event().set()
             await msg.reply_text("🚫 Cancel signal sent. Download will stop shortly...")
 
-        @bot.on_message(filters.text & ~filters.command(["start", "help", "settings", "set", "cancel"]))
+        @bot.on_message(filters.text & ~filters.bot & ~filters.command(["start", "help", "settings", "set", "cancel"]))
         async def handle_message(client, msg: Message):
             if not msg.text:
+                return
+            # Skip messages that arrived before bot started (queued while offline)
+            if msg.date and msg.date.timestamp() < BOT_START_TIME:
                 return
             text = msg.text.strip()
             identifier, link_type = detect_link_type(text)
@@ -1031,10 +1043,16 @@ def run_telethon():
         get_cancel_event().set()
         await event.reply("🚫 Cancel signal sent. Download will stop shortly...")
 
-    @bot.on(events.NewMessage())
+    @bot.on(events.NewMessage(func=lambda e: e.is_private or e.is_group))
     async def handle_message(event):
         text = event.raw_text.strip()
         if not text or text.startswith("/"): return
+        # Skip messages that arrived before bot started (queued while offline)
+        if event.message.date and event.message.date.timestamp() < BOT_START_TIME:
+            return
+        # Ignore messages from other bots
+        sender = await event.get_sender()
+        if getattr(sender, "bot", False): return
 
         identifier, link_type = detect_link_type(text)
         if link_type == "unknown" or not identifier:
