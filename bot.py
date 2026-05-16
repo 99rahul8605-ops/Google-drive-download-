@@ -354,9 +354,11 @@ def settings_text() -> str:
 
 async def handle_gdrive_file(send_fn, edit, file_id, tmp_dir):
     cleanup_stale_tmp()
+    logger.info(f"[GDRIVE] Download start: file_id={file_id}")
     await edit("⬇️ Downloading from Google Drive...")
     loop      = asyncio.get_running_loop()
     real_name = await loop.run_in_executor(None, lambda: get_real_filename(file_id))
+    logger.info(f"[GDRIVE] Resolved filename: {real_name}")
     downloaded = await loop.run_in_executor(
         None, lambda: gdown.download(
             f"https://drive.google.com/uc?id={file_id}&export=download",
@@ -367,6 +369,7 @@ async def handle_gdrive_file(send_fn, edit, file_id, tmp_dir):
     if not downloaded or not os.path.exists(downloaded):
         raise Exception("Download failed. File may be private.")
     fp = Path(downloaded)
+    logger.info(f"[GDRIVE] Downloaded: {fp.name} size={human_size(fp.stat().st_size)}")
     if fp.name == file_id or "." not in fp.name:
         if real_name:
             new = fp.parent / real_name; fp.rename(new); fp = new
@@ -448,11 +451,51 @@ async def handle_direct(send_fn, edit, url, tmp_dir):
                 except Exception: pass
                 super().close()
 
-        reader = StreamingReader()
+        logger.info(f"[DIRECT] Stream start: {filename} size={human_size(remote_size) if remote_size else '?'} url={url}")
+
+        class LoggingReader(io.RawIOBase):
+            """Wraps requests streaming response with progress logging."""
+            def __init__(self):
+                self._resp     = HTTP.get(url, stream=True, timeout=(10, 300), allow_redirects=True)
+                self._resp.raise_for_status()
+                self._iter     = self._resp.iter_content(chunk_size=512 * 1024)
+                self._buf      = b""
+                self.uploaded  = 0
+                self._last_log = 0
+
+            def readable(self): return True
+
+            def readinto(self, b):
+                if cancel.is_set():
+                    return 0
+                while not self._buf:
+                    try:
+                        self._buf = next(self._iter)
+                    except StopIteration:
+                        logger.info(f"[DIRECT] Stream EOF: {filename} total={human_size(self.uploaded)}")
+                        return 0
+                n = min(len(b), len(self._buf))
+                b[:n] = self._buf[:n]
+                self._buf = self._buf[n:]
+                self.uploaded += n
+                # log every 10 MB
+                if self.uploaded - self._last_log >= 10 * 1024 * 1024:
+                    pct = f"{self.uploaded*100//remote_size}%" if remote_size else "?"
+                    logger.info(f"[DIRECT] Streaming {filename}: {human_size(self.uploaded)} / {human_size(remote_size) if remote_size else '?'} ({pct})")
+                    self._last_log = self.uploaded
+                return n
+
+            def close(self):
+                try: self._resp.close()
+                except Exception: pass
+                super().close()
+
+        reader = LoggingReader()
         bio    = io.BufferedReader(reader, buffer_size=4 * 1024 * 1024)
-        bio.name = filename          # Pyrogram/Telethon read .name for file_name
+        bio.name = filename
 
         await send_fn(bio, filename=filename, file_size=remote_size if remote_size else None)
+        logger.info(f"[DIRECT] Stream upload done: {filename}")
 
         if cancel.is_set():
             raise asyncio.CancelledError()
@@ -467,8 +510,11 @@ async def handle_direct(send_fn, edit, url, tmp_dir):
     dest_path  = os.path.join(tmp_dir, filename)
     await edit(f"⬇️ Downloading **{filename}** to disk (>{human_size(MAX_FILE_SIZE)}, will split)...")
 
+    logger.info(f"[DIRECT] Disk download start: {filename} size={human_size(remote_size) if remote_size else '?'}")
     cancelled = [False]
     def _dl():
+        downloaded = 0
+        last_log   = 0
         with HTTP.get(url, stream=True, timeout=(10, 300), allow_redirects=True) as r:
             r.raise_for_status()
             with open(dest_path, "wb") as f:
@@ -476,7 +522,14 @@ async def handle_direct(send_fn, edit, url, tmp_dir):
                     if cancel.is_set():
                         cancelled[0] = True
                         return
-                    if chunk: f.write(chunk)
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if downloaded - last_log >= 50 * 1024 * 1024:
+                            pct = f"{downloaded*100//remote_size}%" if remote_size else "?"
+                            logger.info(f"[DIRECT] Downloaded {human_size(downloaded)} / {human_size(remote_size) if remote_size else '?'} ({pct})")
+                            last_log = downloaded
+        logger.info(f"[DIRECT] Disk download complete: {filename} total={human_size(downloaded)}")
     await loop.run_in_executor(None, _dl)
     if cancelled[0]:
         raise asyncio.CancelledError()
@@ -490,6 +543,7 @@ async def handle_ytdlp(send_fn, edit, url, tmp_dir):
     if not check_cmd("yt-dlp"):
         raise Exception("yt-dlp not installed. Run: pip install yt-dlp")
     cleanup_stale_tmp()
+    logger.info(f"[YTDLP] Download start: {url}")
     await edit("🔍 Fetching media info...")
     loop = asyncio.get_running_loop()
     is_stream = any(urllib.parse.urlparse(url).path.lower().endswith(e) for e in STREAM_EXTS)
@@ -526,6 +580,7 @@ async def handle_ytdlp(send_fn, edit, url, tmp_dir):
     files = [f for f in Path(tmp_dir).iterdir() if f.is_file()]
     if not files: raise Exception("yt-dlp: no output file created.")
     for fp in sorted(files, key=lambda f: f.stat().st_size, reverse=True):
+        logger.info(f"[YTDLP] Sending: {fp.name} size={human_size(fp.stat().st_size)}")
         await split_and_send(send_fn, edit, fp)
 
 
@@ -647,8 +702,10 @@ async def handle_magnet(send_fn, edit, magnet, tmp_dir):
     if not files:
         raise Exception("No files downloaded from magnet.")
 
+    logger.info(f"[MAGNET] Download complete. {len(files)} file(s) found.")
     await edit(f"📦 {len(files)} file(s) mili. Bhej raha hoon...")
     for i, fp in enumerate(sorted(files, key=lambda f: f.name.lower()), 1):
+        logger.info(f"[MAGNET] Sending {i}/{len(files)}: {fp.name} size={human_size(fp.stat().st_size)}")
         await edit(f"📤 {i}/{len(files)}: **{fp.name}** ({human_size(fp.stat().st_size)})")
         await split_and_send(send_fn, edit, fp)
 
@@ -811,6 +868,7 @@ def run_pyrogram():
             else:
                 await lock.acquire()
 
+            logger.info(f"[REQ] user={msg.from_user.id if msg.from_user else '?'} type={link_type} id={identifier[:60]}")
             status  = await msg.reply_text("⏳ Processing...")
             tmp_dir = tempfile.mkdtemp(dir="/tmp")
 
