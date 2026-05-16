@@ -413,8 +413,9 @@ async def handle_gdrive_folder(send_fn, edit, folder_id, tmp_dir):
         await send_fn(fp)
 
 
-async def handle_direct(send_fn, edit, url, tmp_dir):
-    """Stream directly from URL to Telegram — no /tmp disk usage for files under 2 GB.
+async def handle_direct(send_fn, edit, url, tmp_dir, disk_only: bool = False):
+    """Stream directly from URL to Telegram (Pyrogram).
+    disk_only=True: always download to disk first (Telethon — avoids double /tmp copy).
     Falls back to disk for files that need splitting (> 2 GB)."""
     import io
     loop     = asyncio.get_running_loop()
@@ -429,10 +430,50 @@ async def handle_direct(send_fn, edit, url, tmp_dir):
     ext      = Path(filename).suffix.lower()
 
     size_str = f" ({human_size(remote_size)})" if remote_size else ""
-    await edit(f"📡 Streaming **{filename}**{size_str} → Telegram...")
+
+    # ── Telethon disk_only path: download → disk → upload (no double copy) ───
+    if disk_only:
+        tmp_free = get_tmp_free_bytes()
+        if remote_size > 0 and remote_size > tmp_free:
+            raise Exception(f"Not enough /tmp space. Need {human_size(remote_size)}, free {human_size(tmp_free)}")
+        dest_path = os.path.join(tmp_dir, filename)
+        await edit(f"⬇️ **{filename}**{size_str}")
+        _donly_last = [0.0]
+        _donly_loop = loop
+        async def _update_donly(downloaded: int):
+            now = time.time()
+            if now - _donly_last[0] < 3: return
+            _donly_last[0] = now
+            try:
+                if remote_size:
+                    await edit(f"⬇️ **{filename}**\n{progress_bar(downloaded, remote_size)}")
+                else:
+                    await edit(f"⬇️ **{filename}**\n📥 {human_size(downloaded)}")
+            except Exception: pass
+        cancelled = [False]
+        def _dl_donly():
+            downloaded = 0
+            with HTTP.get(url, stream=True, timeout=(10, 300), allow_redirects=True) as r:
+                r.raise_for_status()
+                with open(dest_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+                        if cancel.is_set():
+                            cancelled[0] = True
+                            return
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            asyncio.run_coroutine_threadsafe(_update_donly(downloaded), _donly_loop)
+            logger.info(f"[DIRECT/disk] Done: {filename} {human_size(downloaded)}")
+        await loop.run_in_executor(None, _dl_donly)
+        if cancelled[0]: raise asyncio.CancelledError()
+        fp = fix_filename(Path(dest_path))
+        if not fp.exists(): raise Exception("Download failed.")
+        await split_and_send(send_fn, edit, fp)
+        return
 
     # ── files ≤ 2 GB: stream into memory pipe, upload without touching disk ──
-    if remote_size <= MAX_FILE_SIZE:
+    if remote_size <= MAX_FILE_SIZE and not disk_only:
 
         class StreamingReader(io.RawIOBase):
             """Wraps requests streaming response as a readable file-like object."""
@@ -1070,7 +1111,7 @@ def run_pyrogram():
                     if   link_type == "gdrive_folder": await handle_gdrive_folder(send_fn, edit, identifier, tmp_dir)
                     elif link_type == "gdrive_file":   await handle_gdrive_file(send_fn, edit, identifier, tmp_dir)
                     elif link_type == "ytdlp":         await handle_ytdlp(send_fn, edit, identifier, tmp_dir)
-                    elif link_type == "direct":        await handle_direct(send_fn, edit, identifier, tmp_dir)
+                    elif link_type == "direct":        await handle_direct(send_fn, edit, identifier, tmp_dir, disk_only=True)
                     elif link_type == "magnet":        await handle_magnet(send_fn, edit, identifier, tmp_dir)
             except asyncio.CancelledError:
                 try: await status.edit_text("🚫 Download cancelled.")
@@ -1170,34 +1211,17 @@ def run_telethon():
         tmp_vid_tl  = None
         import asyncio as _aio
 
-        # Telethon's send_file() cannot stream from a non-seekable file-like object —
-        # it reads the whole thing into memory. Always buffer to disk first to avoid OOM.
+        # Note: handle_direct uses disk_only=True for Telethon, so fp is always
+        # a Path here for direct links. Stream objects (non-Path) should not reach
+        # tl_send in normal operation. Guard kept for safety (e.g. gdrive streams).
         if not is_path:
+            logger.warning(f"[TL] Unexpected stream object for {fname} — buffering to disk")
             _t = _tf2.NamedTemporaryFile(delete=False, suffix=ext, dir="/tmp")
-            _buf_last  = [0.0]
-            _buf_total = file_size or 0
-            _buf_written = [0]
-
-            async def _update_buf_progress(written: int):
-                now = time.time()
-                if now - _buf_last[0] < 3: return
-                _buf_last[0] = now
-                try:
-                    if _buf_total:
-                        line = progress_bar(written, _buf_total)
-                        await status_msg.edit(f"⬇️ **{fname}**\n{line}")
-                    else:
-                        await status_msg.edit(f"⬇️ **{fname}**\n📥 {human_size(written)}")
-                except Exception: pass
-
-            _buf_loop = _aio.get_running_loop()
             def _buf_tl():
                 while True:
-                    chunk = fp.read(4 * 1024 * 1024)   # 4 MB chunks — low RAM footprint
+                    chunk = fp.read(4 * 1024 * 1024)
                     if not chunk: break
                     _t.write(chunk)
-                    _buf_written[0] += len(chunk)
-                    asyncio.run_coroutine_threadsafe(_update_buf_progress(_buf_written[0]), _buf_loop)
                 _t.flush()
             await _aio.get_running_loop().run_in_executor(None, _buf_tl)
             _t.close()
