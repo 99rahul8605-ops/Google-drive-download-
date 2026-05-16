@@ -297,8 +297,10 @@ async def run_health_server():
                 pass
 
     port   = int(os.environ.get("PORT", 8080))
-    server = await asyncio.start_server(_handle_client, "0.0.0.0", port)
+    server = await asyncio.start_server(_handle_client, "0.0.0.0", port, start_serving=True)
     logger.info(f"Health server running on port {port}")
+    # keep server reference alive so GC doesn't close it
+    asyncio.get_running_loop().bot_health_server = server
 
 def check_cmd(name):
     try:
@@ -328,7 +330,7 @@ def settings_text() -> str:
 
 async def handle_gdrive_file(send_fn, edit, file_id, tmp_dir):
     await edit("⬇️ Downloading from Google Drive...")
-    loop      = asyncio.get_event_loop()
+    loop      = asyncio.get_running_loop()
     real_name = await loop.run_in_executor(None, lambda: get_real_filename(file_id))
     downloaded = await loop.run_in_executor(
         None, lambda: gdown.download(
@@ -349,7 +351,7 @@ async def handle_gdrive_file(send_fn, edit, file_id, tmp_dir):
 async def handle_gdrive_folder(send_fn, edit, folder_id, tmp_dir):
     folder_dir = os.path.join(tmp_dir, "folder")
     os.makedirs(folder_dir, exist_ok=True)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await edit("⬇️ Fetching Google Drive folder...")
     await loop.run_in_executor(
         None, lambda: gdown.download_folder(
@@ -368,7 +370,7 @@ async def handle_gdrive_folder(send_fn, edit, folder_id, tmp_dir):
 
 
 async def handle_direct(send_fn, edit, url, tmp_dir):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await edit("🔍 Checking file info...")
     remote_size = await loop.run_in_executor(None, lambda: get_remote_file_size(url))
     if remote_size > MAX_DL_SIZE:
@@ -397,7 +399,7 @@ async def handle_ytdlp(send_fn, edit, url, tmp_dir):
     if not check_cmd("yt-dlp"):
         raise Exception("yt-dlp not installed. Run: pip install yt-dlp")
     await edit("🔍 Fetching media info...")
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     is_stream = any(urllib.parse.urlparse(url).path.lower().endswith(e) for e in STREAM_EXTS)
     outtmpl   = os.path.join(tmp_dir, "stream_%(id)s.%(ext)s" if is_stream else "%(title).60s.%(ext)s")
     cmd = [
@@ -449,7 +451,7 @@ async def handle_magnet(send_fn, edit, magnet, tmp_dir):
     )
     await asyncio.sleep(2)  # daemon start hone do
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def rpc(method, params=None):
         payload = {
@@ -661,6 +663,8 @@ def run_pyrogram():
 
     @bot.on_message(filters.text & ~filters.command(["start", "help", "settings", "set"]))
     async def handle_message(client, msg: Message):
+        if not msg.text:
+            return
         text = msg.text.strip()
         identifier, link_type = detect_link_type(text)
         if link_type == "unknown" or not identifier:
@@ -694,6 +698,8 @@ def run_pyrogram():
 
     logger.info("Starting with Pyrogram...")
 
+    from pyrogram import idle
+
     async def main():
         await run_health_server()
         await bot.start()
@@ -718,7 +724,6 @@ def run_pyrogram():
         await idle()
         await bot.stop()
 
-    from pyrogram import idle
     asyncio.run(main())
 
 
@@ -783,7 +788,7 @@ def run_telethon():
     async def settings_cmd(event):
         await event.reply(settings_text())
 
-    @bot.on(events.NewMessage(pattern="/set"))
+    @bot.on(events.NewMessage(pattern=r"^/set(?:\s|$)"))
     async def set_cmd(event):
         parts = event.raw_text.strip().split()
         await handle_set_cmd(parts, event.reply)
