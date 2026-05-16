@@ -760,6 +760,57 @@ async def handle_set_cmd(parts, reply_fn):
         await reply_fn("❌ Unknown key. Use: `library`, `workers`, `maxdl`")
 
 
+def get_video_meta(filepath: str) -> dict:
+    """Extract width, height, duration, has_audio from video using ffprobe."""
+    try:
+        import json as _json
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", filepath],
+            capture_output=True, text=True, timeout=15,
+        )
+        data    = _json.loads(result.stdout)
+        streams = data.get("streams", [])
+        vstream = next((s for s in streams if s.get("codec_type") == "video"), {})
+        has_audio = any(s.get("codec_type") == "audio" for s in streams)
+        width    = int(vstream.get("width", 0))
+        height   = int(vstream.get("height", 0))
+        dur_str  = vstream.get("duration", "0")
+        duration = int(float(dur_str)) if dur_str else 0
+        return {"width": width, "height": height, "duration": duration, "has_audio": has_audio}
+    except Exception:
+        return {}
+
+def ensure_audio_track(filepath: str) -> str:
+    """If video has no audio stream, add a silent audio track via ffmpeg.
+    Telegram converts silent short videos to GIF regardless of size — this prevents that.
+    Returns path to fixed file (may be a new temp file), or original if ffmpeg unavailable."""
+    try:
+        meta = get_video_meta(filepath)
+        if meta.get("has_audio", True):
+            return filepath   # already has audio, nothing to do
+        p        = Path(filepath)
+        out_path = str(p.parent / (p.stem + "_audio" + p.suffix))
+        result   = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", filepath,
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                "-c:v", "copy", "-c:a", "aac", "-shortest",
+                "-movflags", "+faststart",
+                out_path,
+            ],
+            capture_output=True, timeout=120,
+        )
+        if result.returncode == 0 and Path(out_path).exists():
+            logger.info(f"[FFMPEG] Added silent audio track: {Path(filepath).name}")
+            try: Path(filepath).unlink()
+            except Exception: pass
+            return out_path
+    except Exception as e:
+        logger.warning(f"[FFMPEG] ensure_audio_track failed: {e}")
+    return filepath
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  PYROGRAM BOT
 # ═════════════════════════════════════════════════════════════════════════════
@@ -791,27 +842,6 @@ def run_pyrogram():
                     await status_msg.edit_text(f"📤 **{filename}**\n{bar} {pct}%")
                 except Exception:
                     pass
-
-        def get_video_meta(filepath: str) -> dict:
-            """Extract width, height, duration from video using ffprobe."""
-            try:
-                import json as _json
-                result = subprocess.run(
-                    [
-                        "ffprobe", "-v", "quiet", "-print_format", "json",
-                        "-show_streams", "-select_streams", "v:0", filepath,
-                    ],
-                    capture_output=True, text=True, timeout=15,
-                )
-                data    = _json.loads(result.stdout)
-                stream  = data.get("streams", [{}])[0]
-                width   = int(stream.get("width", 0))
-                height  = int(stream.get("height", 0))
-                dur_str = stream.get("duration", "0")
-                duration = int(float(dur_str)) if dur_str else 0
-                return {"width": width, "height": height, "duration": duration}
-            except Exception:
-                return {}
 
         async def pg_send(client, message, status_msg, fp, filename=None, file_size=None):
             # fp can be a Path (disk file) or a file-like object (streaming)
@@ -845,6 +875,9 @@ def run_pyrogram():
                         await _loop.run_in_executor(None, _buf)
                         _tmp.close()
                         _disk = Path(_tmp.name)
+                        # Add silent audio track if missing — prevents GIF conversion
+                        _fixed = await _loop.run_in_executor(None, ensure_audio_track, str(_disk))
+                        _disk  = Path(_fixed)
                         _meta = get_video_meta(str(_disk))
                         await client.send_video(
                             video=str(_disk), supports_streaming=True,
@@ -857,6 +890,10 @@ def run_pyrogram():
                         try: Path(_tmp.name).unlink()
                         except Exception: pass
                 else:
+                    # Ensure video has an audio track — Telegram converts silent
+                    # videos to GIF regardless of file size or metadata.
+                    _loop2 = asyncio.get_running_loop()
+                    src = await _loop2.run_in_executor(None, ensure_audio_track, src)
                     meta = get_video_meta(src)
                     await client.send_video(
                         video=src, supports_streaming=True,
@@ -1072,6 +1109,15 @@ def run_telethon():
                 _t.close()
                 tmp_vid_tl  = _t.name
                 actual_src  = tmp_vid_tl
+
+            # Add silent audio track if missing — prevents GIF conversion
+            _fixed_tl  = await _aio.get_running_loop().run_in_executor(None, ensure_audio_track, actual_src)
+            if _fixed_tl != actual_src:
+                if tmp_vid_tl: 
+                    try: Path(tmp_vid_tl).unlink()
+                    except Exception: pass
+                tmp_vid_tl = _fixed_tl
+                actual_src = _fixed_tl
 
             try:
                 from telethon.tl.types import DocumentAttributeVideo
