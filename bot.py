@@ -698,11 +698,10 @@ def run_pyrogram():
 
     logger.info("Starting with Pyrogram...")
 
-    from pyrogram import idle
-
     async def main():
         await run_health_server()
         await bot.start()
+        logger.info("Pyrogram bot started and listening...")
 
         if OWNER_ID:
             s   = load_settings()
@@ -721,7 +720,22 @@ def run_pyrogram():
             except Exception as e:
                 logger.warning(f"Startup msg failed: {e}")
 
-        await idle()
+        # Keep running until interrupted — no pyrogram idle() needed
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def _sig_handler():
+            logger.info("Shutdown signal received")
+            stop_event.set()
+
+        import signal
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _sig_handler)
+            except (NotImplementedError, RuntimeError):
+                pass  # Windows or restricted env
+
+        await stop_event.wait()
         await bot.stop()
 
     asyncio.run(main())
