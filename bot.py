@@ -643,27 +643,32 @@ def run_pyrogram():
 
     logger.info("Starting with Pyrogram...")
 
-    async def send_startup_msg():
-        if not OWNER_ID:
-            return
-        s   = load_settings()
-        lib = s["library"]
-        txt = (
-            f"✅ **Bot Started!**\n\n"
-            f"🔧 Engine: `Pyrogram`\n"
-            f"👷 Workers: `{s['workers']}`\n"
-            f"💾 Max DL: `{s['max_dl_gb']} GB`\n"
-            f"✂️ Split: `1.95 GB` per part\n"
-            f"{'✅' if check_cmd('yt-dlp') else '❌'} yt-dlp | "
-            f"{'✅' if check_cmd('aria2c') else '❌'} aria2c\n\n"
-            f"🕐 `{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
-        )
-        try:
-            await bot.send_message(OWNER_ID, txt)
-        except Exception as e:
-            logger.warning(f"Startup msg failed: {e}")
+    async def main():
+        await bot.start()
 
-    bot.run(send_startup_msg())
+        # Startup message
+        if OWNER_ID:
+            s   = load_settings()
+            txt = (
+                f"✅ **Bot Started!**\n\n"
+                f"🔧 Engine: `Pyrogram`\n"
+                f"👷 Workers: `{s['workers']}`\n"
+                f"💾 Max DL: `{s['max_dl_gb']} GB`\n"
+                f"✂️ Split: `1.95 GB` per part\n"
+                f"{'✅' if check_cmd('yt-dlp') else '❌'} yt-dlp | "
+                f"{'✅' if check_cmd('aria2c') else '❌'} aria2c\n\n"
+                f"🕐 `{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
+            )
+            try:
+                await bot.send_message(OWNER_ID, txt)
+            except Exception as e:
+                logger.warning(f"Startup msg failed: {e}")
+
+        await idle()
+        await bot.stop()
+
+    from pyrogram import idle
+    asyncio.run(main())
 
 
 # ═════════════════════════════════════════════════════════════════════════════
