@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import logging
 import asyncio
@@ -243,6 +244,11 @@ def get_tmp_usage() -> str:
     except Exception:
         return "unknown"
 
+def auto_restart():
+    """Restart the bot process with same arguments."""
+    logger.info("Restarting bot...")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
 def check_cmd(name):
     try:
         subprocess.run([name, "--version"], capture_output=True, check=True)
@@ -364,21 +370,79 @@ async def handle_ytdlp(send_fn, edit, url, tmp_dir):
 async def handle_magnet(send_fn, edit, magnet, tmp_dir):
     if not check_cmd("aria2c"):
         raise Exception("aria2c not installed. Run: apt install aria2")
-    await edit("🧲 Starting magnet download...\n⚠️ Depends on seeders.")
-    loop = asyncio.get_event_loop()
-    cmd = ["aria2c", "--dir", tmp_dir, "--seed-time=0",
-           "--max-connection-per-server=4", "--split=4",
-           "--bt-stop-timeout=300", "--timeout=60", magnet]
-    def _run():
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        if r.returncode != 0: raise Exception(r.stderr.strip() or "aria2c failed.")
+
+    await edit("🧲 Starting magnet download...\n⏳ Connecting to peers...")
+
+    cmd = [
+        "aria2c",
+        "--dir", tmp_dir,
+        "--seed-time=0",
+        "--max-connection-per-server=4",
+        "--split=4",
+        "--bt-stop-timeout=300",
+        "--timeout=60",
+        "--summary-interval=3",      # progress line every 3 seconds
+        "--human-readable=true",
+        magnet,
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+
+    # aria2c progress line looks like:
+    # [#ab1234 10MiB/100MiB(10%) CN:4 DL:1.2MiB ETA:1m30s]
+    progress_re = re.compile(
+        r"\[#\w+\s+([\d.]+\w+)/([\d.]+\w+)\((\d+)%\).*?DL:([\d.]+\w+).*?ETA:(\S+)\]"
+    )
+    last_edit = 0.0
+
+    async def read_output():
+        nonlocal last_edit
+        async for line in proc.stdout:
+            text = line.decode(errors="ignore").strip()
+            if not text:
+                continue
+            logger.debug(f"aria2c: {text}")
+
+            m = progress_re.search(text)
+            if m:
+                downloaded, total, pct, speed, eta = m.groups()
+                now = asyncio.get_event_loop().time()
+                if now - last_edit >= 3:   # update every 3s max
+                    bar = "█" * (int(pct) // 10) + "░" * (10 - int(pct) // 10)
+                    try:
+                        await edit(
+                            f"🧲 **Magnet Download**\n"
+                            f"{bar} {pct}%\n"
+                            f"📥 {downloaded} / {total}\n"
+                            f"⚡ Speed: {speed}/s\n"
+                            f"⏱ ETA: {eta}"
+                        )
+                        last_edit = now
+                    except Exception:
+                        pass
+
     try:
-        await loop.run_in_executor(None, _run)
-    except subprocess.TimeoutExpired:
-        raise Exception("Magnet timed out (15 min). Try with more seeders.")
+        await asyncio.wait_for(
+            asyncio.gather(proc.wait(), read_output()),
+            timeout=1800   # 30 min max
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise Exception("Magnet timed out (30 min). Try with more seeders.")
+
+    if proc.returncode != 0:
+        raise Exception("aria2c failed. Check magnet link or seeders.")
+
     files = [f for f in Path(tmp_dir).rglob("*") if f.is_file()]
-    if not files: raise Exception("No files downloaded from magnet.")
-    await edit(f"📦 {len(files)} file(s). Sending...")
+    if not files:
+        raise Exception("No files downloaded from magnet.")
+
+    await edit(f"📦 Download complete! {len(files)} file(s). Sending...")
+
     for i, fp in enumerate(sorted(files, key=lambda f: f.name.lower()), 1):
         await edit(f"📤 {i}/{len(files)}: **{fp.name}** ({human_size(fp.stat().st_size)})")
         await split_and_send(send_fn, edit, fp)
@@ -392,25 +456,35 @@ async def handle_set_cmd(parts, reply_fn):
         return
     key, val = parts[1].lower(), parts[2].lower()
     s = load_settings()
+
     if key == "library":
         if val not in ("pyrogram", "telethon"):
             await reply_fn("❌ Library must be `pyrogram` or `telethon`"); return
+        if s["library"] == val:
+            await reply_fn(f"ℹ️ Already using `{val}`"); return
         s["library"] = val; save_settings(s)
-        await reply_fn(f"✅ Library set to `{val}`\n⚠️ **Restart bot** to apply.")
+        await reply_fn(f"✅ Library switched to `{val}`\n🔄 Restarting bot...")
+        await asyncio.sleep(1)   # reply bhejne ka waqt do
+        auto_restart()
+
     elif key == "workers":
         try:
             n = int(val); assert 1 <= n <= 8
         except Exception:
             await reply_fn("❌ Workers must be 1–8"); return
         s["workers"] = n; save_settings(s)
-        await reply_fn(f"✅ Workers set to `{n}`\n⚠️ Restart to apply.")
+        await reply_fn(f"✅ Workers set to `{n}`\n🔄 Restarting bot...")
+        await asyncio.sleep(1)
+        auto_restart()
+
     elif key == "maxdl":
         try:
-            n = float(val); assert 0.1 <= n <= 1.9
+            n = float(val); assert 0.1 <= n <= 10.0
         except Exception:
-            await reply_fn("❌ Max download must be 0.1–1.9 GB"); return
+            await reply_fn("❌ Max download must be 0.1–10.0 GB"); return
         s["max_dl_gb"] = n; save_settings(s)
-        await reply_fn(f"✅ Max download set to `{n} GB`")
+        await reply_fn(f"✅ Max download set to `{n} GB` (files > 2GB will be split)")
+
     else:
         await reply_fn("❌ Unknown key. Use: `library`, `workers`, `maxdl`")
 
