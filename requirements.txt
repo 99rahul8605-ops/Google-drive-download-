@@ -5,3 +5,4 @@ requests==2.32.3
 telethon
 yt-dlp
 aiohttp
+flask
