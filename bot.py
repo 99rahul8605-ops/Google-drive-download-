@@ -833,7 +833,8 @@ def run_pyrogram():
                     import tempfile as _tf
                     _tmp = _tf.NamedTemporaryFile(delete=False, suffix=ext, dir="/tmp")
                     try:
-                        await edit(f"⬇️ Buffering **{fname}** for upload...")
+                        try: await status_msg.edit_text(f"⬇️ Buffering **{fname}** for upload...")
+                        except Exception: pass
                         _loop = asyncio.get_running_loop()
                         def _buf():
                             while True:
@@ -1046,17 +1047,37 @@ def run_telethon():
             try: await status_msg.edit(f"📤 **{fname}**\n{bar} {pct}%"); last[0] = now
             except Exception: pass
 
-        # Build attributes — for video files, always pass DocumentAttributeVideo with
-        # explicit dimensions/duration so Telegram never misidentifies the file as a GIF.
-        # Instagram reels are often short silent mp4s which Telegram renders as GIF otherwise.
-        attributes = []
-        if ext in VIDEO_EXTS and is_path:
+        # For video files: buffer stream to disk if needed (send_file may seek),
+        # then attach DocumentAttributeVideo so Telegram never misidentifies as GIF.
+        import json as _json
+        import tempfile as _tf2
+
+        actual_src  = src
+        tmp_vid_tl  = None
+
+        if ext in VIDEO_EXTS:
+            if not is_path:
+                # Stream is not seekable — buffer to a temp file first
+                try: await status_msg.edit(f"⬇️ Buffering **{fname}** for upload...")
+                except Exception: pass
+                _t = _tf2.NamedTemporaryFile(delete=False, suffix=ext, dir="/tmp")
+                def _buf_tl():
+                    while True:
+                        chunk = fp.read(4 * 1024 * 1024)
+                        if not chunk: break
+                        _t.write(chunk)
+                    _t.flush()
+                import asyncio as _aio
+                await _aio.get_running_loop().run_in_executor(None, _buf_tl)
+                _t.close()
+                tmp_vid_tl  = _t.name
+                actual_src  = tmp_vid_tl
+
             try:
-                import json as _json
                 from telethon.tl.types import DocumentAttributeVideo
                 result = subprocess.run(
                     ["ffprobe", "-v", "quiet", "-print_format", "json",
-                     "-show_streams", "-select_streams", "v:0", src],
+                     "-show_streams", "-select_streams", "v:0", actual_src],
                     capture_output=True, text=True, timeout=15,
                 )
                 stream   = _json.loads(result.stdout).get("streams", [{}])[0]
@@ -1069,15 +1090,22 @@ def run_telethon():
                 )]
             except Exception:
                 attributes = []
+        else:
+            attributes = None   # let Telethon auto-detect for audio/documents
 
-        await client.send_file(
-            chat_id, src, caption=caption,
-            attributes=attributes,
-            supports_streaming=ext in VIDEO_EXTS,
-            force_document=ext not in (VIDEO_EXTS | AUDIO_EXTS),
-            part_size_kb=512,
-            progress_callback=progress,
-        )
+        try:
+            await client.send_file(
+                chat_id, actual_src, caption=caption,
+                attributes=attributes,
+                supports_streaming=ext in VIDEO_EXTS,
+                force_document=ext not in (VIDEO_EXTS | AUDIO_EXTS),
+                part_size_kb=512,
+                progress_callback=progress,
+            )
+        finally:
+            if tmp_vid_tl:
+                try: Path(tmp_vid_tl).unlink()
+                except Exception: pass
         if is_path:
             try: fp.unlink()
             except Exception: pass
