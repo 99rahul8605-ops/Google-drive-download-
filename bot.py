@@ -693,7 +693,6 @@ def run_pyrogram():
 
         # ── start bot ────────────────────────────────────────────────────────
 
-        await run_health_server()
         await bot.start()
         logger.info("Pyrogram bot started and listening...")
 
@@ -728,9 +727,13 @@ def run_pyrogram():
                 pass
 
         await stop_event.wait()
-        await bot.stop()
+        try:
+            await bot.stop()
+        except Exception as e:
+            logger.warning(f"bot.stop() warning (safe to ignore): {e}")
 
     logger.info("Starting with Pyrogram...")
+    start_health_server()   # bind port BEFORE asyncio.run so Render health check passes
     asyncio.run(main())
 
 
@@ -837,7 +840,6 @@ def run_telethon():
             logger.info(f"/tmp after cleanup: {get_tmp_usage()}")
 
     async def _run():
-        await run_health_server()
         await bot.start(bot_token=BOT_TOKEN)
         logger.info("Starting with Telethon...")
 
@@ -860,6 +862,7 @@ def run_telethon():
 
         await bot.run_until_disconnected()
 
+    start_health_server()   # bind port before asyncio.run
     asyncio.run(_run())
 
 
