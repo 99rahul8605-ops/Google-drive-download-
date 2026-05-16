@@ -29,9 +29,9 @@ API_HASH  = os.environ.get("TELEGRAM_API_HASH", "")
 
 SETTINGS_FILE    = "settings.json"
 DEFAULT_SETTINGS = {
-    "library":   "pyrogram",   # "pyrogram" or "telethon"
+    "library":   "pyrogram",
     "workers":   4,
-    "max_dl_gb": 1.8,
+    "max_dl_gb": 1.95,          # ~2GB safe limit
 }
 
 def load_settings() -> dict:
@@ -51,8 +51,8 @@ def save_settings(s: dict):
         json.dump(s, f, indent=2)
 
 SETTINGS      = load_settings()
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024
-MAX_DL_SIZE   = int(SETTINGS["max_dl_gb"] * 1024 * 1024 * 1024)
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024          # 2 GB — Telegram free limit
+MAX_DL_SIZE   = 10 * 1024 * 1024 * 1024         # 10 GB — will be split if > 2GB
 
 # ── Patterns ──────────────────────────────────────────────────────────────────
 
@@ -69,7 +69,8 @@ FOLDER_PATTERNS = [
 YTDLP_DOMAINS = [
     "youtube.com", "youtu.be", "instagram.com", "twitter.com", "x.com",
     "tiktok.com", "facebook.com", "fb.watch", "reddit.com", "dailymotion.com",
-    "vimeo.com", "twitch.tv", "soundcloud.com", "pinterest.com", "streamable.com",
+    "vimeo.com", "twitch.tv", "soundcloud.com", "pinterest.com", "pin.it",
+    "pinterest.co.uk", "pinterest.in", "streamable.com",
     "bilibili.com", "rumble.com", "odysee.com", "kick.com",
 ]
 MAGNET_PATTERN = re.compile(r"magnet:\?xt=urn:[a-zA-Z0-9]+:[a-fA-F0-9]{32,40}", re.IGNORECASE)
@@ -196,6 +197,45 @@ def fix_filename(fp: Path) -> Path:
             return new
     return fp
 
+
+SPLIT_SIZE = 1950 * 1024 * 1024   # 1.95 GB per part — safe under 2GB limit
+
+async def split_and_send(send_fn, edit, fp: Path):
+    """Split file into 1.95GB parts and send each one."""
+    file_size = fp.stat().st_size
+
+    if file_size <= MAX_FILE_SIZE:
+        await send_fn(fp)
+        return
+
+    total_parts = (file_size + SPLIT_SIZE - 1) // SPLIT_SIZE
+    await edit(f"✂️ File is {human_size(file_size)} — splitting into {total_parts} parts...")
+
+    stem = fp.stem
+    ext  = fp.suffix
+    part_paths = []
+
+    with open(fp, "rb") as f:
+        for i in range(1, total_parts + 1):
+            part_name = fp.parent / f"{stem}.part{i:02d}of{total_parts:02d}{ext}"
+            chunk     = f.read(SPLIT_SIZE)
+            if not chunk:
+                break
+            with open(part_name, "wb") as pf:
+                pf.write(chunk)
+            part_paths.append(part_name)
+            await edit(f"✂️ Part {i}/{total_parts} ready ({human_size(len(chunk))}). Sending...")
+            await send_fn(part_name)   # send immediately — don't wait for all parts
+            # part file deleted inside send_fn after upload
+
+    # Delete original large file
+    try:
+        fp.unlink()
+    except Exception:
+        pass
+
+    await edit(f"✅ Sent all {total_parts} parts of **{fp.name}**")
+
 def get_tmp_usage() -> str:
     try:
         stat = shutil.disk_usage("/tmp")
@@ -246,9 +286,7 @@ async def handle_gdrive_file(send_fn, edit, file_id, tmp_dir):
         if real_name:
             new = fp.parent / real_name; fp.rename(new); fp = new
     fp = fix_filename(fp)
-    if fp.stat().st_size > MAX_FILE_SIZE:
-        raise Exception(f"File {human_size(fp.stat().st_size)} exceeds 2 GB limit.")
-    await send_fn(fp)
+    await split_and_send(send_fn, edit, fp)
 
 
 async def handle_gdrive_folder(send_fn, edit, folder_id, tmp_dir):
@@ -278,6 +316,7 @@ async def handle_direct(send_fn, edit, url, tmp_dir):
     remote_size = await loop.run_in_executor(None, lambda: get_remote_file_size(url))
     if remote_size > MAX_DL_SIZE:
         raise Exception(f"File too large: {human_size(remote_size)} (max {human_size(MAX_DL_SIZE)})")
+
     tmp_free = shutil.disk_usage("/tmp").free
     if remote_size > 0 and remote_size > tmp_free:
         raise Exception(f"Not enough /tmp space. Need {human_size(remote_size)}, free {human_size(tmp_free)}")
@@ -294,7 +333,7 @@ async def handle_direct(send_fn, edit, url, tmp_dir):
     fp = fix_filename(Path(dest_path))
     if not fp.exists():
         raise Exception("Download failed.")
-    await send_fn(fp)
+    await split_and_send(send_fn, edit, fp)
 
 
 async def handle_ytdlp(send_fn, edit, url, tmp_dir):
@@ -319,9 +358,7 @@ async def handle_ytdlp(send_fn, edit, url, tmp_dir):
     files = [f for f in Path(tmp_dir).iterdir() if f.is_file()]
     if not files: raise Exception("yt-dlp: no output file created.")
     for fp in sorted(files, key=lambda f: f.stat().st_size, reverse=True):
-        if fp.stat().st_size > MAX_FILE_SIZE:
-            raise Exception(f"File {human_size(fp.stat().st_size)} exceeds 2 GB.")
-        await send_fn(fp)
+        await split_and_send(send_fn, edit, fp)
 
 
 async def handle_magnet(send_fn, edit, magnet, tmp_dir):
@@ -343,10 +380,8 @@ async def handle_magnet(send_fn, edit, magnet, tmp_dir):
     if not files: raise Exception("No files downloaded from magnet.")
     await edit(f"📦 {len(files)} file(s). Sending...")
     for i, fp in enumerate(sorted(files, key=lambda f: f.name.lower()), 1):
-        if fp.stat().st_size > MAX_FILE_SIZE:
-            await edit(f"⚠️ Skipping {fp.name} — too large"); continue
-        await edit(f"📤 {i}/{len(files)}: **{fp.name}**")
-        await send_fn(fp)
+        await edit(f"📤 {i}/{len(files)}: **{fp.name}** ({human_size(fp.stat().st_size)})")
+        await split_and_send(send_fn, edit, fp)
 
 
 # ── Common set command logic ──────────────────────────────────────────────────
