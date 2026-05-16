@@ -81,7 +81,19 @@ AUDIO_EXTS     = {".mp3", ".m4a", ".ogg", ".flac", ".wav", ".aac", ".opus"}
 
 HTTP             = requests.Session()
 HTTP.headers.update({"User-Agent": "Mozilla/5.0"})
-_download_lock   = asyncio.Lock()
+_download_lock: asyncio.Lock | None = None
+
+def get_download_lock() -> asyncio.Lock:
+    """Always return a Lock tied to the current running event loop."""
+    global _download_lock
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    # Re-create if no lock yet, or if the existing lock belongs to a different loop
+    if _download_lock is None or getattr(_download_lock, "_loop", None) is not loop:
+        _download_lock = asyncio.Lock()
+    return _download_lock
 
 
 # ── Link detection ────────────────────────────────────────────────────────────
@@ -653,7 +665,8 @@ def run_pyrogram():
         identifier, link_type = detect_link_type(text)
         if link_type == "unknown" or not identifier:
             await msg.reply_text("❓ Unsupported link. Use /help."); return
-        if _download_lock.locked():
+        lock = get_download_lock()
+        if lock.locked():
             await msg.reply_text("⏳ Another download in progress. Please wait."); return
 
         status  = await msg.reply_text("⏳ Processing...")
@@ -665,7 +678,7 @@ def run_pyrogram():
             except Exception: pass
 
         try:
-            async with _download_lock:
+            async with lock:
                 if   link_type == "gdrive_folder": await handle_gdrive_folder(send_fn, edit, identifier, tmp_dir)
                 elif link_type == "gdrive_file":   await handle_gdrive_file(send_fn, edit, identifier, tmp_dir)
                 elif link_type == "ytdlp":         await handle_ytdlp(send_fn, edit, identifier, tmp_dir)
@@ -783,7 +796,8 @@ def run_telethon():
         identifier, link_type = detect_link_type(text)
         if link_type == "unknown" or not identifier:
             await event.reply("❓ Unsupported link. Use /help."); return
-        if _download_lock.locked():
+        lock = get_download_lock()
+        if lock.locked():
             await event.reply("⏳ Another download in progress. Please wait."); return
 
         status  = await event.reply("⏳ Processing...")
@@ -796,7 +810,7 @@ def run_telethon():
             except Exception: pass
 
         try:
-            async with _download_lock:
+            async with lock:
                 if   link_type == "gdrive_folder": await handle_gdrive_folder(send_fn, edit, identifier, tmp_dir)
                 elif link_type == "gdrive_file":   await handle_gdrive_file(send_fn, edit, identifier, tmp_dir)
                 elif link_type == "ytdlp":         await handle_ytdlp(send_fn, edit, identifier, tmp_dir)
