@@ -1,8 +1,6 @@
 pyrogram==2.0.106
-tgcrypto==1.2.5
+TgCrypto==1.2.5
 gdown==5.2.0
 requests==2.32.3
-aria2
-yt-dlp
-ffmpeg
 telethon
+yt-dlp
