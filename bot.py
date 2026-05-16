@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 API_ID    = int(os.environ.get("TELEGRAM_API_ID", "0"))
 API_HASH  = os.environ.get("TELEGRAM_API_HASH", "")
+OWNER_ID  = int(os.environ.get("OWNER_ID", "0"))   # apna Telegram user ID daalo
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -371,78 +372,121 @@ async def handle_magnet(send_fn, edit, magnet, tmp_dir):
     if not check_cmd("aria2c"):
         raise Exception("aria2c not installed. Run: apt install aria2")
 
-    await edit("🧲 Starting magnet download...\n⏳ Connecting to peers...")
+    await edit("🧲 Magnet download shuru ho raha hai...")
 
-    cmd = [
+    RPC_PORT = 6800
+    RPC_URL  = f"http://localhost:{RPC_PORT}/jsonrpc"
+    RPC_SECRET = "aria2secret"
+
+    # ── aria2c daemon RPC mode mein start karo ────────────────────────────────
+    daemon_cmd = [
         "aria2c",
+        "--enable-rpc",
+        f"--rpc-listen-port={RPC_PORT}",
+        f"--rpc-secret={RPC_SECRET}",
+        "--daemon=true",
         "--dir", tmp_dir,
         "--seed-time=0",
         "--max-connection-per-server=4",
         "--split=4",
         "--bt-stop-timeout=300",
-        "--timeout=60",
-        "--summary-interval=3",      # progress line every 3 seconds
-        "--human-readable=true",
-        magnet,
+        "--log-level=error",
     ]
-
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+        *daemon_cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
     )
+    await asyncio.sleep(2)  # daemon start hone do
 
-    # aria2c progress line looks like:
-    # [#ab1234 10MiB/100MiB(10%) CN:4 DL:1.2MiB ETA:1m30s]
-    progress_re = re.compile(
-        r"\[#\w+\s+([\d.]+\w+)/([\d.]+\w+)\((\d+)%\).*?DL:([\d.]+\w+).*?ETA:(\S+)\]"
-    )
-    last_edit = 0.0
+    loop = asyncio.get_event_loop()
 
-    async def read_output():
-        nonlocal last_edit
-        async for line in proc.stdout:
-            text = line.decode(errors="ignore").strip()
-            if not text:
-                continue
-            logger.debug(f"aria2c: {text}")
+    def rpc(method, params=None):
+        payload = {
+            "jsonrpc": "2.0", "id": "bot",
+            "method": method,
+            "params": [f"token:{RPC_SECRET}"] + (params or []),
+        }
+        r = HTTP.post(RPC_URL, json=payload, timeout=10)
+        return r.json().get("result")
 
-            m = progress_re.search(text)
-            if m:
-                downloaded, total, pct, speed, eta = m.groups()
-                now = asyncio.get_event_loop().time()
-                if now - last_edit >= 3:   # update every 3s max
-                    bar = "█" * (int(pct) // 10) + "░" * (10 - int(pct) // 10)
-                    try:
-                        await edit(
-                            f"🧲 **Magnet Download**\n"
-                            f"{bar} {pct}%\n"
-                            f"📥 {downloaded} / {total}\n"
-                            f"⚡ Speed: {speed}/s\n"
-                            f"⏱ ETA: {eta}"
-                        )
-                        last_edit = now
-                    except Exception:
-                        pass
-
+    # ── Magnet add karo ───────────────────────────────────────────────────────
     try:
-        await asyncio.wait_for(
-            asyncio.gather(proc.wait(), read_output()),
-            timeout=1800   # 30 min max
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        raise Exception("Magnet timed out (30 min). Try with more seeders.")
+        gid = await loop.run_in_executor(None, lambda: rpc("aria2.addUri", [[magnet]]))
+    except Exception as e:
+        raise Exception(f"aria2c RPC error: {e}. Check if port {RPC_PORT} is free.")
 
-    if proc.returncode != 0:
-        raise Exception("aria2c failed. Check magnet link or seeders.")
+    await edit(f"🧲 Magnet queued! Peers dhundh raha hai...\n🔑 GID: `{gid}`")
 
+    # ── Progress polling ──────────────────────────────────────────────────────
+    start_time = loop.time()
+    TIMEOUT    = 1800  # 30 min
+
+    while True:
+        await asyncio.sleep(3)
+
+        if loop.time() - start_time > TIMEOUT:
+            await loop.run_in_executor(None, lambda: rpc("aria2.remove", [gid]))
+            raise Exception("Magnet timed out (30 min). Try with more seeders.")
+
+        try:
+            status = await loop.run_in_executor(None, lambda: rpc("aria2.tellStatus", [gid]))
+        except Exception:
+            continue
+
+        if not status:
+            continue
+
+        dl_state  = status.get("status", "")
+        completed = int(status.get("completedLength", 0))
+        total     = int(status.get("totalLength", 0))
+        speed     = int(status.get("downloadSpeed", 0))
+        seeders   = status.get("numSeeders", "0")
+        name      = status.get("bittorrent", {}).get("info", {}).get("name", "Unknown")
+
+        if dl_state == "error":
+            err = status.get("errorMessage", "Unknown error")
+            raise Exception(f"aria2c error: {err}")
+
+        if dl_state == "complete":
+            await edit(f"✅ Download complete!\n📁 **{name}**\n📦 {human_size(total)}")
+            break
+
+        pct = (completed * 100 // total) if total > 0 else 0
+        bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+        eta_sec = ((total - completed) // speed) if speed > 0 else 0
+        eta_str = f"{eta_sec // 60}m {eta_sec % 60}s" if speed > 0 else "..."
+
+        state_icon = {
+            "active":  "⬇️",
+            "waiting": "⏳",
+            "paused":  "⏸",
+        }.get(dl_state, "🔄")
+
+        try:
+            await edit(
+                f"🧲 **{name or 'Magnet Download'}**\n"
+                f"{bar} {pct}%\n"
+                f"{state_icon} {human_size(completed)} / {human_size(total) if total else '?'}\n"
+                f"⚡ Speed: {human_size(speed)}/s\n"
+                f"🌱 Seeders: {seeders}\n"
+                f"⏱ ETA: {eta_str}"
+            )
+        except Exception:
+            pass
+
+    # ── Aria2c daemon band karo ───────────────────────────────────────────────
+    try:
+        await loop.run_in_executor(None, lambda: rpc("aria2.shutdown"))
+    except Exception:
+        pass
+
+    # ── Files bhejo ──────────────────────────────────────────────────────────
     files = [f for f in Path(tmp_dir).rglob("*") if f.is_file()]
     if not files:
         raise Exception("No files downloaded from magnet.")
 
-    await edit(f"📦 Download complete! {len(files)} file(s). Sending...")
-
+    await edit(f"📦 {len(files)} file(s) mili. Bhej raha hoon...")
     for i, fp in enumerate(sorted(files, key=lambda f: f.name.lower()), 1):
         await edit(f"📤 {i}/{len(files)}: **{fp.name}** ({human_size(fp.stat().st_size)})")
         await split_and_send(send_fn, edit, fp)
@@ -598,7 +642,28 @@ def run_pyrogram():
             logger.info(f"/tmp after cleanup: {get_tmp_usage()}")
 
     logger.info("Starting with Pyrogram...")
-    bot.run()
+
+    async def send_startup_msg():
+        if not OWNER_ID:
+            return
+        s   = load_settings()
+        lib = s["library"]
+        txt = (
+            f"✅ **Bot Started!**\n\n"
+            f"🔧 Engine: `Pyrogram`\n"
+            f"👷 Workers: `{s['workers']}`\n"
+            f"💾 Max DL: `{s['max_dl_gb']} GB`\n"
+            f"✂️ Split: `1.95 GB` per part\n"
+            f"{'✅' if check_cmd('yt-dlp') else '❌'} yt-dlp | "
+            f"{'✅' if check_cmd('aria2c') else '❌'} aria2c\n\n"
+            f"🕐 `{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
+        )
+        try:
+            await bot.send_message(OWNER_ID, txt)
+        except Exception as e:
+            logger.warning(f"Startup msg failed: {e}")
+
+    bot.run(send_startup_msg())
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -705,6 +770,24 @@ def run_telethon():
     async def _run():
         await bot.start(bot_token=BOT_TOKEN)
         logger.info("Starting with Telethon...")
+
+        if OWNER_ID:
+            s   = load_settings()
+            txt = (
+                f"✅ **Bot Started!**\n\n"
+                f"🔧 Engine: `Telethon`\n"
+                f"👷 Workers: `{s['workers']}`\n"
+                f"💾 Max DL: `{s['max_dl_gb']} GB`\n"
+                f"✂️ Split: `1.95 GB` per part\n"
+                f"{'✅' if check_cmd('yt-dlp') else '❌'} yt-dlp | "
+                f"{'✅' if check_cmd('aria2c') else '❌'} aria2c\n\n"
+                f"🕐 `{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
+            )
+            try:
+                await bot.send_message(OWNER_ID, txt)
+            except Exception as e:
+                logger.warning(f"Startup msg failed: {e}")
+
         await bot.run_until_disconnected()
 
     asyncio.run(_run())
