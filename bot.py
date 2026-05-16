@@ -792,6 +792,27 @@ def run_pyrogram():
                 except Exception:
                     pass
 
+        def get_video_meta(filepath: str) -> dict:
+            """Extract width, height, duration from video using ffprobe."""
+            try:
+                import json as _json
+                result = subprocess.run(
+                    [
+                        "ffprobe", "-v", "quiet", "-print_format", "json",
+                        "-show_streams", "-select_streams", "v:0", filepath,
+                    ],
+                    capture_output=True, text=True, timeout=15,
+                )
+                data    = _json.loads(result.stdout)
+                stream  = data.get("streams", [{}])[0]
+                width   = int(stream.get("width", 0))
+                height  = int(stream.get("height", 0))
+                dur_str = stream.get("duration", "0")
+                duration = int(float(dur_str)) if dur_str else 0
+                return {"width": width, "height": height, "duration": duration}
+            except Exception:
+                return {}
+
         async def pg_send(client, message, status_msg, fp, filename=None, file_size=None):
             # fp can be a Path (disk file) or a file-like object (streaming)
             is_path  = isinstance(fp, Path)
@@ -805,7 +826,44 @@ def run_pyrogram():
                 progress=pg_progress, progress_args=(status_msg, fname),
             )
             if ext in VIDEO_EXTS:
-                await client.send_video(video=src, supports_streaming=True, **kw)
+                # Pyrogram send_video internally calls seek() — fails on live HTTP streams.
+                # Buffer the stream to a temp file first so we can pass a seekable file
+                # with full metadata, preventing Telegram from rendering it as a GIF.
+                if not is_path:
+                    import tempfile as _tf
+                    _tmp = _tf.NamedTemporaryFile(delete=False, suffix=ext, dir="/tmp")
+                    try:
+                        await edit(f"⬇️ Buffering **{fname}** for upload...")
+                        _loop = asyncio.get_running_loop()
+                        def _buf():
+                            while True:
+                                chunk = fp.read(4 * 1024 * 1024)
+                                if not chunk: break
+                                _tmp.write(chunk)
+                            _tmp.flush()
+                        await _loop.run_in_executor(None, _buf)
+                        _tmp.close()
+                        _disk = Path(_tmp.name)
+                        _meta = get_video_meta(str(_disk))
+                        await client.send_video(
+                            video=str(_disk), supports_streaming=True,
+                            width=_meta.get("width") or None,
+                            height=_meta.get("height") or None,
+                            duration=_meta.get("duration") or None,
+                            **kw,
+                        )
+                    finally:
+                        try: Path(_tmp.name).unlink()
+                        except Exception: pass
+                else:
+                    meta = get_video_meta(src)
+                    await client.send_video(
+                        video=src, supports_streaming=True,
+                        width=meta.get("width") or None,
+                        height=meta.get("height") or None,
+                        duration=meta.get("duration") or None,
+                        **kw,
+                    )
             elif ext in AUDIO_EXTS:
                 await client.send_audio(audio=src, **kw)
             else:
@@ -988,9 +1046,33 @@ def run_telethon():
             try: await status_msg.edit(f"📤 **{fname}**\n{bar} {pct}%"); last[0] = now
             except Exception: pass
 
+        # Build attributes — for video files, always pass DocumentAttributeVideo with
+        # explicit dimensions/duration so Telegram never misidentifies the file as a GIF.
+        # Instagram reels are often short silent mp4s which Telegram renders as GIF otherwise.
+        attributes = []
+        if ext in VIDEO_EXTS and is_path:
+            try:
+                import json as _json
+                from telethon.tl.types import DocumentAttributeVideo
+                result = subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-print_format", "json",
+                     "-show_streams", "-select_streams", "v:0", src],
+                    capture_output=True, text=True, timeout=15,
+                )
+                stream   = _json.loads(result.stdout).get("streams", [{}])[0]
+                width    = int(stream.get("width", 0)) or 1280
+                height   = int(stream.get("height", 0)) or 720
+                duration = int(float(stream.get("duration", "0") or "0"))
+                attributes = [DocumentAttributeVideo(
+                    duration=duration, w=width, h=height,
+                    supports_streaming=True,
+                )]
+            except Exception:
+                attributes = []
+
         await client.send_file(
             chat_id, src, caption=caption,
-            attributes=[],
+            attributes=attributes,
             supports_streaming=ext in VIDEO_EXTS,
             force_document=ext not in (VIDEO_EXTS | AUDIO_EXTS),
             part_size_kb=512,
