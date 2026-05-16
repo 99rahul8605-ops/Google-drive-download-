@@ -785,13 +785,18 @@ def get_video_meta(filepath: str) -> dict:
         streams = data.get("streams", [])
         vstream = next((s for s in streams if s.get("codec_type") == "video"), {})
         has_audio = any(s.get("codec_type") == "audio" for s in streams)
-        width    = int(vstream.get("width", 0))
-        height   = int(vstream.get("height", 0))
-        dur_str  = vstream.get("duration", "0")
+        width    = int(vstream.get("width") or 0)
+        height   = int(vstream.get("height") or 0)
+        dur_str  = vstream.get("duration") or "0"
         duration = int(float(dur_str)) if dur_str else 0
-        return {"width": width, "height": height, "duration": duration, "has_audio": has_audio}
+        return {
+            "width":     max(0, width),
+            "height":    max(0, height),
+            "duration":  max(0, duration),
+            "has_audio": has_audio,
+        }
     except Exception:
-        return {}
+        return {"width": 0, "height": 0, "duration": 0, "has_audio": False}
 
 def ensure_audio_track(filepath: str) -> str:
     """If video has no audio stream, add a silent audio track via ffmpeg.
@@ -893,9 +898,9 @@ def run_pyrogram():
                         _meta = get_video_meta(str(_disk))
                         await client.send_video(
                             video=str(_disk), supports_streaming=True,
-                            width=_meta.get("width") or None,
-                            height=_meta.get("height") or None,
-                            duration=_meta.get("duration") or None,
+                            width=int(_meta.get("width") or 0),
+                            height=int(_meta.get("height") or 0),
+                            duration=int(_meta.get("duration") or 0),
                             **kw,
                         )
                     finally:
@@ -909,9 +914,9 @@ def run_pyrogram():
                     meta = get_video_meta(src)
                     await client.send_video(
                         video=src, supports_streaming=True,
-                        width=meta.get("width") or None,
-                        height=meta.get("height") or None,
-                        duration=meta.get("duration") or None,
+                        width=int(meta.get("width") or 0),
+                        height=int(meta.get("height") or 0),
+                        duration=int(meta.get("duration") or 0),
                         **kw,
                     )
             elif ext in AUDIO_EXTS:
@@ -1139,9 +1144,9 @@ def run_telethon():
                     capture_output=True, text=True, timeout=15,
                 )
                 stream   = _json.loads(result.stdout).get("streams", [{}])[0]
-                width    = int(stream.get("width", 0)) or 1280
-                height   = int(stream.get("height", 0)) or 720
-                duration = int(float(stream.get("duration", "0") or "0"))
+                width    = int(stream.get("width") or 0) or 1280
+                height   = int(stream.get("height") or 0) or 720
+                duration = int(float(stream.get("duration") or "0"))
                 attributes = [DocumentAttributeVideo(
                     duration=duration, w=width, h=height,
                     supports_streaming=True,
