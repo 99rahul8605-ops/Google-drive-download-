@@ -1272,12 +1272,12 @@ async def handle_drm_download(send_fn_builder, edit_builder, reply_fn,
                     try: Path(thumb).unlink()
                     except Exception: pass
 
-        if   link_type == "gdrive_folder": await handle_gdrive_folder(send_with_thumb, edit, identifier, tmp_dir)
-        elif link_type == "gdrive_file":   await handle_gdrive_file(send_with_thumb, edit, identifier, tmp_dir)
-        elif link_type == "ytdlp":         await handle_ytdlp(send_with_thumb, edit, identifier, tmp_dir)
-        elif link_type == "direct":        await handle_direct(send_with_thumb, edit, identifier, tmp_dir)
-        elif link_type == "magnet":        await handle_magnet(send_with_thumb, edit, identifier, tmp_dir)
+        if   link_type == "direct":        await handle_direct(send_with_thumb, edit, identifier, tmp_dir)
         elif link_type == "stream_page":   await handle_stream_page(send_with_thumb, edit, identifier, tmp_dir)
+        elif link_type == "ytdlp":         await handle_ytdlp(send_with_thumb, edit, identifier, tmp_dir)
+        elif link_type == "gdrive_file":   await handle_gdrive_file(send_with_thumb, edit, identifier, tmp_dir)
+        elif link_type == "gdrive_folder": await handle_gdrive_folder(send_with_thumb, edit, identifier, tmp_dir)
+        elif link_type == "magnet":        await handle_magnet(send_with_thumb, edit, identifier, tmp_dir)
 
     except asyncio.CancelledError:
         try: await edit("🚫 Download cancelled.")
