@@ -1196,25 +1196,28 @@ async def handle_stream_page(send_fn, edit, url, tmp_dir):
 
 
 def extract_thumbnail(video_path: str, out_dir: str) -> str | None:
-    """Extract first frame of video as JPEG thumbnail using ffmpeg.
-    Returns path to thumbnail file, or None if ffmpeg unavailable."""
-    try:
-        thumb_path = os.path.join(out_dir, "thumb.jpg")
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", video_path,
-                "-ss", "00:00:01",          # 1 second in (avoids black frame)
-                "-vframes", "1",
-                "-vf", "scale=320:-1",      # 320px wide thumbnail
-                "-q:v", "3",
-                thumb_path,
-            ],
-            capture_output=True, timeout=30,
-        )
-        if result.returncode == 0 and Path(thumb_path).exists():
-            return thumb_path
-    except Exception as e:
-        logger.warning(f"[THUMB] extract_thumbnail failed: {e}")
+    """Extract frame from video as JPEG thumbnail using ffmpeg.
+    Tries 5s, 2s, 1s, 10s timestamps to avoid black frames."""
+    thumb_path = os.path.join(out_dir, "thumb.jpg")
+    for ts in ["00:00:05", "00:00:02", "00:00:01", "00:00:10"]:
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-ss", ts,
+                    "-i", video_path,
+                    "-vframes", "1",
+                    "-vf", "scale=320:-2",
+                    "-q:v", "2",
+                    thumb_path,
+                ],
+                capture_output=True, timeout=30,
+            )
+            if result.returncode == 0 and Path(thumb_path).exists() and Path(thumb_path).stat().st_size > 1000:
+                logger.info(f"[THUMB] OK at {ts}: {thumb_path}")
+                return thumb_path
+        except Exception as e:
+            logger.warning(f"[THUMB] Failed at {ts}: {e}")
     return None
 
 
@@ -1351,13 +1354,13 @@ def run_pyrogram():
                 # Pyrogram send_video internally calls seek() — fails on live HTTP streams.
                 # Buffer the stream to a temp file first so we can pass a seekable file
                 # with full metadata, preventing Telegram from rendering it as a GIF.
+                _loop = asyncio.get_running_loop()
                 if not is_path:
                     import tempfile as _tf
                     _tmp = _tf.NamedTemporaryFile(delete=False, suffix=ext, dir="/tmp")
                     try:
                         try: await status_msg.edit_text(f"⬇️ Buffering **{fname}** for upload...")
                         except Exception: pass
-                        _loop = asyncio.get_running_loop()
                         def _buf():
                             while True:
                                 chunk = fp.read(4 * 1024 * 1024)
@@ -1370,6 +1373,10 @@ def run_pyrogram():
                         # Add silent audio track if missing — prevents GIF conversion
                         _fixed = await _loop.run_in_executor(None, ensure_audio_track, str(_disk))
                         _disk  = Path(_fixed)
+                        # Extract thumbnail
+                        if not thumb:
+                            thumb = await _loop.run_in_executor(None, extract_thumbnail, str(_disk), str(_disk.parent))
+                            logger.info(f"[THUMB] pg_send stream thumb: {thumb}")
                         _meta = get_video_meta(str(_disk))
                         await client.send_video(
                             video=str(_disk), supports_streaming=True,
@@ -1382,11 +1389,17 @@ def run_pyrogram():
                     finally:
                         try: Path(_tmp.name).unlink()
                         except Exception: pass
+                        if thumb:
+                            try: Path(thumb).unlink()
+                            except Exception: pass
                 else:
                     # Ensure video has an audio track — Telegram converts silent
                     # videos to GIF regardless of file size or metadata.
-                    _loop2 = asyncio.get_running_loop()
-                    src = await _loop2.run_in_executor(None, ensure_audio_track, src)
+                    src = await _loop.run_in_executor(None, ensure_audio_track, src)
+                    # Extract thumbnail if not provided
+                    if not thumb:
+                        thumb = await _loop.run_in_executor(None, extract_thumbnail, src, str(Path(src).parent))
+                        logger.info(f"[THUMB] pg_send disk thumb: {thumb}")
                     meta = get_video_meta(src)
                     await client.send_video(
                         video=src, supports_streaming=True,
@@ -1396,6 +1409,9 @@ def run_pyrogram():
                         thumb=thumb,
                         **kw,
                     )
+                    if thumb:
+                        try: Path(thumb).unlink()
+                        except Exception: pass
             elif ext in AUDIO_EXTS:
                 await client.send_audio(audio=src, **kw)
             else:
@@ -1712,13 +1728,18 @@ def run_telethon():
                 pass  # already buffered above
 
             # Extract thumbnail if not provided
-            if not thumb and is_path:
+            if not thumb:
                 try:
+                    _thumb_dir = str(Path(actual_src).parent)
                     thumb = await _aio.get_running_loop().run_in_executor(
-                        None, extract_thumbnail, actual_src, str(fp.parent)
+                        None, extract_thumbnail, actual_src, _thumb_dir
                     )
-                except Exception:
-                    pass
+                    if thumb:
+                        logger.info(f"[THUMB] Extracted: {thumb}")
+                    else:
+                        logger.warning(f"[THUMB] Failed to extract thumbnail for {actual_src}")
+                except Exception as _te:
+                    logger.warning(f"[THUMB] Exception: {_te}")
 
             # Add silent audio track if missing — prevents GIF conversion
             _fixed_tl  = await _aio.get_running_loop().run_in_executor(None, ensure_audio_track, actual_src)
