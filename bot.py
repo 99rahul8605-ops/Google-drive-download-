@@ -135,6 +135,7 @@ def detect_link_type(text: str):
         pass
     if re.match(r"https?://", text):
         path = urllib.parse.urlparse(text).path.lower()
+        query = urllib.parse.urlparse(text).query.lower()
         if any(path.endswith(ext) for ext in STREAM_EXTS):
             return text, "ytdlp"
         # Direct file link — URL path ends with a known media/archive extension
@@ -146,6 +147,9 @@ def detect_link_type(text: str):
             ".docx", ".xlsx", ".pptx", ".txt", ".csv",
         }
         if any(path.endswith(ext) for ext in ALL_MEDIA_EXTS):
+            return text, "direct"
+        # Download link indicators — treat as direct
+        if "mode=download" in query or "/dl/" in path or "download=1" in query:
             return text, "direct"
         # Looks like a webpage — try to scrape video from it
         return text, "stream_page"
@@ -1331,7 +1335,7 @@ def run_pyrogram():
             except Exception:
                 pass
 
-        async def pg_send(client, message, status_msg, fp, filename=None, file_size=None):
+        async def pg_send(client, message, status_msg, fp, filename=None, file_size=None, thumb=None):
             # fp can be a Path (disk file) or a file-like object (streaming)
             is_path  = isinstance(fp, Path)
             fname    = filename or (fp.name if is_path else "file")
@@ -1372,6 +1376,7 @@ def run_pyrogram():
                             width=int(_meta.get("width") or 0),
                             height=int(_meta.get("height") or 0),
                             duration=int(_meta.get("duration") or 0),
+                            thumb=thumb,
                             **kw,
                         )
                     finally:
@@ -1388,6 +1393,7 @@ def run_pyrogram():
                         width=int(meta.get("width") or 0),
                         height=int(meta.get("height") or 0),
                         duration=int(meta.get("duration") or 0),
+                        thumb=thumb,
                         **kw,
                     )
             elif ext in AUDIO_EXTS:
@@ -1485,17 +1491,12 @@ def run_pyrogram():
 
             drm_sessions[uid] = {"state": "awaiting_index", "links": links}
 
-            # Build numbered list (show max 50 to avoid flood)
-            lines = [f"`{i+1}.` {l[:80]}{'...' if len(l)>80 else ''}" for i, l in enumerate(links[:50])]
-            if len(links) > 50:
-                lines.append(f"... aur {len(links)-50} links")
             reply = (
                 f"✅ **{len(links)} links mili!**\n\n"
-                + "\n".join(lines)
-                + f"\n\n📥 Konsa index download karna hai? (1–{len(links)})\n"
-                  f"Single `5` → 5 se end tak sab\n"
-                  f"Multiple: `1 3 5` | Range: `2-5`\n"
-                  f"Cancel: `/cancel`"
+                f"📥 Konsa index download karna hai? (1–{len(links)})\n"
+                f"Single `5` → 5 se end tak sab\n"
+                f"Multiple: `1 3 5` | Range: `2-5`\n"
+                f"Cancel: `/cancel`"
             )
             await msg.reply_text(reply)
 
@@ -1847,16 +1848,12 @@ def run_telethon():
 
         drm_sessions[uid] = {"state": "awaiting_index", "links": links}
 
-        lines = [f"`{i+1}.` {l[:80]}{'...' if len(l)>80 else ''}" for i, l in enumerate(links[:50])]
-        if len(links) > 50:
-            lines.append(f"... aur {len(links)-50} links")
         reply = (
             f"✅ **{len(links)} links mili!**\n\n"
-            + "\n".join(lines)
-            + f"\n\n📥 Konsa index download karna hai? (1–{len(links)})\n"
-              f"Single `5` → 5 se end tak sab\n"
-              f"Multiple: `1 3 5` | Range: `2-5`\n"
-              f"Cancel: `/cancel`"
+            f"📥 Konsa index download karna hai? (1–{len(links)})\n"
+            f"Single `5` → 5 se end tak sab\n"
+            f"Multiple: `1 3 5` | Range: `2-5`\n"
+            f"Cancel: `/cancel`"
         )
         await event.reply(reply)
 
