@@ -133,7 +133,18 @@ def detect_link_type(text: str):
         path = urllib.parse.urlparse(text).path.lower()
         if any(path.endswith(ext) for ext in STREAM_EXTS):
             return text, "ytdlp"
-        return text, "direct"
+        # Direct file link — URL path ends with a known media/archive extension
+        ALL_MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS | {
+            ".pdf", ".zip", ".rar", ".7z", ".tar", ".gz",
+            ".jpg", ".jpeg", ".png", ".gif", ".webp",
+            ".mp4", ".mkv", ".mov", ".avi", ".webm",
+            ".mp3", ".m4a", ".ogg", ".flac", ".wav",
+            ".docx", ".xlsx", ".pptx", ".txt", ".csv",
+        }
+        if any(path.endswith(ext) for ext in ALL_MEDIA_EXTS):
+            return text, "direct"
+        # Looks like a webpage — try to scrape video from it
+        return text, "stream_page"
     return None, "unknown"
 
 
@@ -924,6 +935,175 @@ def ensure_audio_track(filepath: str) -> str:
     return filepath
 
 
+async def handle_stream_page(send_fn, edit, url, tmp_dir):
+    """
+    Scrape a webpage for embedded video URLs, then download the best one.
+
+    Strategy (in order):
+      1. yt-dlp — handles 1000+ sites natively (fastest path)
+      2. HTML/JS scrape — find .m3u8 / .mp4 / etc. URLs in page source
+      3. <video src> / <source src> tags
+      4. JSON-LD / og:video meta tags
+      5. If a direct media URL is found, hand off to handle_direct
+         If a stream URL (.m3u8/.mpd) is found, hand off to handle_ytdlp
+    """
+    cancel = get_cancel_event()
+    loop   = asyncio.get_running_loop()
+
+    # ── Step 1: try yt-dlp first (covers most embed players) ─────────────────
+    if check_cmd("yt-dlp"):
+        await edit("🔍 Trying yt-dlp on page...")
+        try:
+            # Run yt-dlp --simulate to check if it can extract anything
+            sim = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ["yt-dlp", "--simulate", "--no-playlist",
+                     "--no-warnings", "--quiet", url],
+                    capture_output=True, text=True, timeout=30,
+                )
+            )
+            if sim.returncode == 0:
+                logger.info(f"[STREAM_PAGE] yt-dlp can handle: {url}")
+                await handle_ytdlp(send_fn, edit, url, tmp_dir)
+                return
+            logger.info(f"[STREAM_PAGE] yt-dlp can't handle ({sim.returncode}), falling back to scrape")
+        except Exception as e:
+            logger.warning(f"[STREAM_PAGE] yt-dlp simulate error: {e}")
+
+    if cancel.is_set():
+        raise asyncio.CancelledError()
+
+    # ── Step 2: fetch page source ─────────────────────────────────────────────
+    await edit("🔍 Scraping page for video links...")
+    try:
+        resp = await loop.run_in_executor(
+            None,
+            lambda: HTTP.get(url, timeout=15, allow_redirects=True,
+                             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                                    "Chrome/124.0 Safari/537.36"})
+        )
+        resp.raise_for_status()
+        html = resp.text
+    except Exception as e:
+        raise Exception(f"Could not fetch page: {e}")
+
+    if cancel.is_set():
+        raise asyncio.CancelledError()
+
+    # ── Step 3: extract candidate URLs from page ──────────────────────────────
+    base = f"{urllib.parse.urlparse(url).scheme}://{urllib.parse.urlparse(url).netloc}"
+
+    def make_absolute(u: str) -> str:
+        u = u.strip().strip('"\'')
+        if u.startswith("//"):
+            return "https:" + u
+        if u.startswith("/"):
+            return base + u
+        if not u.startswith("http"):
+            return url.rstrip("/") + "/" + u
+        return u
+
+    candidates: list[tuple[int, str]] = []   # (priority, url)
+
+    # Pattern-based extraction — look in entire HTML/JS source
+    stream_url_re = re.compile(
+        r'(?:src|file|url|source|stream|hls|dash|video|media|href)\s*[=:]\s*'
+        r'["\']?(https?://[^\s"\'<>]+?'
+        r'(?:\.m3u8|\.mpd|\.mp4|\.mkv|\.mov|\.webm|\.avi|\.flv|\.m4v|\.3gp|\.ts)'
+        r'[^\s"\'<>]*)',
+        re.IGNORECASE,
+    )
+    for m in stream_url_re.finditer(html):
+        u = make_absolute(m.group(1))
+        ext = Path(urllib.parse.urlparse(u).path).suffix.lower()
+        priority = 1 if ext in STREAM_EXTS else 2
+        candidates.append((priority, u))
+        logger.debug(f"[STREAM_PAGE] regex hit: {u}")
+
+    # <video src=...> and <source src=...>
+    tag_re = re.compile(
+        r'<(?:video|source)[^>]+src\s*=\s*["\']([^"\']+)["\']',
+        re.IGNORECASE,
+    )
+    for m in tag_re.finditer(html):
+        u = make_absolute(m.group(1))
+        candidates.append((2, u))
+        logger.debug(f"[STREAM_PAGE] tag hit: {u}")
+
+    # og:video / og:video:url meta tags
+    og_re = re.compile(
+        r'<meta[^>]+(?:property|name)\s*=\s*["\']og:video(?::url)?["\'][^>]+content\s*=\s*["\']([^"\']+)["\']',
+        re.IGNORECASE,
+    )
+    for m in og_re.finditer(html):
+        u = make_absolute(m.group(1))
+        candidates.append((1, u))
+        logger.debug(f"[STREAM_PAGE] og:video hit: {u}")
+
+    # JSON-LD — find contentUrl / embedUrl
+    jsonld_re = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.DOTALL | re.IGNORECASE)
+    for m in jsonld_re.finditer(html):
+        try:
+            import json as _json
+            obj = _json.loads(m.group(1))
+            for key in ("contentUrl", "embedUrl", "url"):
+                val = obj.get(key, "")
+                if val and re.search(r'\.(m3u8|mp4|mpd|mkv|webm)', val, re.IGNORECASE):
+                    candidates.append((1, make_absolute(val)))
+                    logger.debug(f"[STREAM_PAGE] json-ld hit ({key}): {val}")
+        except Exception:
+            pass
+
+    # Bare URLs anywhere in source (fallback)
+    bare_re = re.compile(
+        r'https?://[^\s"\'<>]+?'
+        r'(?:\.m3u8|\.mpd|\.mp4|\.mkv|\.mov|\.webm|\.avi|\.flv|\.m4v|\.3gp|\.ts)'
+        r'(?:[^\s"\'<>]*)?',
+        re.IGNORECASE,
+    )
+    for m in bare_re.finditer(html):
+        u = m.group(0)
+        ext = Path(urllib.parse.urlparse(u).path).suffix.lower()
+        priority = 1 if ext in STREAM_EXTS else 3
+        candidates.append((priority, u))
+
+    if not candidates:
+        raise Exception(
+            "No video URL found on page.\n"
+            "The video may be behind a login, DRM-protected, or loaded via JavaScript.\n"
+            "Try sending the direct video URL instead."
+        )
+
+    # Deduplicate while preserving best priority
+    seen: dict[str, int] = {}
+    for pri, u in candidates:
+        if u not in seen or pri < seen[u]:
+            seen[u] = pri
+    unique = sorted(seen.items(), key=lambda x: x[1])   # lower priority number = better
+
+    logger.info(f"[STREAM_PAGE] Found {len(unique)} unique video URL(s)")
+    for u, p in unique[:5]:
+        logger.info(f"[STREAM_PAGE]   pri={p} url={u[:100]}")
+
+    best_url, best_pri = unique[0]
+    best_ext = Path(urllib.parse.urlparse(best_url).path).suffix.lower()
+
+    await edit(f"🎯 Video URL mili!\n`{best_url[:80]}{'...' if len(best_url) > 80 else ''}`\n⬇️ Download shuru...")
+
+    if cancel.is_set():
+        raise asyncio.CancelledError()
+
+    # ── Step 4: hand off to right handler ────────────────────────────────────
+    if best_ext in STREAM_EXTS or best_ext == ".ts":
+        # HLS / DASH stream → yt-dlp handles merging segments
+        await handle_ytdlp(send_fn, edit, best_url, tmp_dir)
+    else:
+        # Direct media file
+        await handle_direct(send_fn, edit, best_url, tmp_dir)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  PYROGRAM BOT
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1050,7 +1230,9 @@ def run_pyrogram():
                 "• Direct HTTP/HTTPS file links\n"
                 "• YouTube, Instagram, Twitter/X, TikTok + 1000 more (yt-dlp)\n"
                 "• `.m3u8` / HLS streams\n"
-                "• Magnet links (aria2c required)\n\n"
+                "• Magnet links (aria2c required)\n"
+                "• 🆕 Stream pages — kisi bhi webpage ka link do,\n"
+                "  bot automatically video URL dhundh ke download karega\n\n"
                 "⚠️ Max 2 GB | One download at a time\n"
                 "/cancel — stop current download"
             )
@@ -1113,6 +1295,7 @@ def run_pyrogram():
                     elif link_type == "ytdlp":         await handle_ytdlp(send_fn, edit, identifier, tmp_dir)
                     elif link_type == "direct":        await handle_direct(send_fn, edit, identifier, tmp_dir, disk_only=True)
                     elif link_type == "magnet":        await handle_magnet(send_fn, edit, identifier, tmp_dir)
+                    elif link_type == "stream_page":   await handle_stream_page(send_fn, edit, identifier, tmp_dir)
             except asyncio.CancelledError:
                 try: await status.edit_text("🚫 Download cancelled.")
                 except Exception: pass
@@ -1298,7 +1481,9 @@ def run_telethon():
             "• Direct HTTP/HTTPS file links\n"
             "• YouTube, Instagram, Twitter/X, TikTok + 1000 more (yt-dlp)\n"
             "• `.m3u8` / HLS streams\n"
-            "• Magnet links (aria2c required)\n\n"
+            "• Magnet links (aria2c required)\n"
+            "• 🆕 Stream pages — kisi bhi webpage ka link do,\n"
+            "  bot automatically video URL dhundh ke download karega\n\n"
             "⚠️ Max 2 GB | One download at a time\n"
             "/cancel — stop current download"
         )
@@ -1364,6 +1549,7 @@ def run_telethon():
                 elif link_type == "ytdlp":         await handle_ytdlp(send_fn, edit, identifier, tmp_dir)
                 elif link_type == "direct":        await handle_direct(send_fn, edit, identifier, tmp_dir)
                 elif link_type == "magnet":        await handle_magnet(send_fn, edit, identifier, tmp_dir)
+                elif link_type == "stream_page":   await handle_stream_page(send_fn, edit, identifier, tmp_dir)
         except asyncio.CancelledError:
             try: await status.edit("🚫 Download cancelled.")
             except Exception: pass
