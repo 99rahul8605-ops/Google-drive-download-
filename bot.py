@@ -424,16 +424,39 @@ async def handle_gdrive_folder(send_fn, edit, folder_id, tmp_dir):
         await send_fn(fp)
 
 
-async def handle_direct(send_fn, edit, url, tmp_dir, disk_only: bool = False):
+async def handle_direct(send_fn, edit, url, tmp_dir, disk_only: bool = False,
+                        extra_headers: dict | None = None):
     """Stream directly from URL to Telegram (Pyrogram).
     disk_only=True: always download to disk first (Telethon — avoids double /tmp copy).
-    Falls back to disk for files that need splitting (> 2 GB)."""
+    Falls back to disk for files that need splitting (> 2 GB).
+    extra_headers: additional HTTP headers (e.g. Referer) forwarded to all requests."""
     import io
     loop     = asyncio.get_running_loop()
     cancel   = get_cancel_event()
 
+    # Merge extra_headers into a session-like headers dict for this download
+    req_headers: dict = {}
+    if extra_headers:
+        req_headers.update(extra_headers)
+
+    def http_get(u, **kw):
+        h = dict(req_headers)
+        h.update(kw.pop("headers", {}))
+        return HTTP.get(u, headers=h, **kw)
+
+    def http_head(u, **kw):
+        h = dict(req_headers)
+        h.update(kw.pop("headers", {}))
+        return HTTP.head(u, headers=h, **kw)
+
     await edit("🔍 Checking file info...")
-    remote_size = await loop.run_in_executor(None, lambda: get_remote_file_size(url))
+    def _get_size():
+        try:
+            r = http_head(url, allow_redirects=True, timeout=10)
+            return int(r.headers.get("Content-Length", 0))
+        except Exception:
+            return 0
+    remote_size = await loop.run_in_executor(None, _get_size)
     if remote_size > MAX_DL_SIZE:
         raise Exception(f"File too large: {human_size(remote_size)} (max {human_size(MAX_DL_SIZE)})")
 
@@ -464,7 +487,7 @@ async def handle_direct(send_fn, edit, url, tmp_dir, disk_only: bool = False):
         cancelled = [False]
         def _dl_donly():
             downloaded = 0
-            with HTTP.get(url, stream=True, timeout=(10, 300), allow_redirects=True) as r:
+            with http_get(url, stream=True, timeout=(10, 300), allow_redirects=True) as r:
                 r.raise_for_status()
                 with open(dest_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
@@ -489,7 +512,7 @@ async def handle_direct(send_fn, edit, url, tmp_dir, disk_only: bool = False):
         class StreamingReader(io.RawIOBase):
             """Wraps requests streaming response as a readable file-like object."""
             def __init__(self):
-                self._resp  = HTTP.get(url, stream=True, timeout=(10, 300), allow_redirects=True)
+                self._resp  = http_get(url, stream=True, timeout=(10, 300), allow_redirects=True)
                 self._resp.raise_for_status()
                 self._iter  = self._resp.iter_content(chunk_size=512 * 1024)
                 self._buf   = b""
@@ -539,7 +562,7 @@ async def handle_direct(send_fn, edit, url, tmp_dir, disk_only: bool = False):
         class LoggingReader(io.RawIOBase):
             """Wraps requests streaming response with Telegram progress updates."""
             def __init__(self):
-                self._resp     = HTTP.get(url, stream=True, timeout=(10, 300), allow_redirects=True)
+                self._resp     = http_get(url, stream=True, timeout=(10, 300), allow_redirects=True)
                 self._resp.raise_for_status()
                 self._iter     = self._resp.iter_content(chunk_size=512 * 1024)
                 self._buf      = b""
@@ -618,7 +641,7 @@ async def handle_direct(send_fn, edit, url, tmp_dir, disk_only: bool = False):
     _disk_loop = asyncio.get_running_loop()
     def _dl():
         downloaded = 0
-        with HTTP.get(url, stream=True, timeout=(10, 300), allow_redirects=True) as r:
+        with http_get(url, stream=True, timeout=(10, 300), allow_redirects=True) as r:
             r.raise_for_status()
             with open(dest_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
@@ -639,7 +662,7 @@ async def handle_direct(send_fn, edit, url, tmp_dir, disk_only: bool = False):
     await split_and_send(send_fn, edit, fp)
 
 
-async def handle_ytdlp(send_fn, edit, url, tmp_dir):
+async def handle_ytdlp(send_fn, edit, url, tmp_dir, extra_args: list | None = None):
     if not check_cmd("yt-dlp"):
         raise Exception("yt-dlp not installed. Run: pip install yt-dlp")
     cleanup_stale_tmp()
@@ -682,6 +705,8 @@ async def handle_ytdlp(send_fn, edit, url, tmp_dir):
             "--add-header",
             "User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
         ]
+    if extra_args:
+        cmd += extra_args
     cmd.append(url)
     await edit("⬇️ Downloading stream..." if is_stream else "⬇️ Downloading via yt-dlp...")
     cancel = get_cancel_event()
@@ -940,110 +965,127 @@ async def handle_stream_page(send_fn, edit, url, tmp_dir):
     Scrape a webpage for embedded video URLs, then download the best one.
 
     Strategy (in order):
-      1. yt-dlp — handles 1000+ sites natively (fastest path)
-      2. HTML/JS scrape — find .m3u8 / .mp4 / etc. URLs in page source
-      3. <video src> / <source src> tags
-      4. JSON-LD / og:video meta tags
-      5. If a direct media URL is found, hand off to handle_direct
-         If a stream URL (.m3u8/.mpd) is found, hand off to handle_ytdlp
+      1. yt-dlp --simulate on the PAGE URL (not scraped URLs)
+      2. HTML/JS scrape — JS template literals filtered out, URLs validated
+      3. HEAD-check each candidate to pick first reachable one
+      4. Referer header passed to handle_direct to avoid 403s
     """
     cancel = get_cancel_event()
     loop   = asyncio.get_running_loop()
 
-    # ── Step 1: try yt-dlp first (covers most embed players) ─────────────────
+    PAGE_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        ),
+        "Referer": url,
+    }
+
+    def is_js_template(u: str) -> bool:
+        """Return True if URL contains unresolved JS template literal like ${...}."""
+        return bool(re.search(r'\$\{[^}]+\}', u))
+
+    def url_ext(u: str) -> str:
+        """Get extension from URL path (ignores query string)."""
+        return Path(urllib.parse.urlparse(u).path).suffix.lower()
+
+    # ── Step 1: yt-dlp on the PAGE URL ───────────────────────────────────────
     if check_cmd("yt-dlp"):
-        await edit("🔍 Trying yt-dlp on page...")
+        await edit("🔍 yt-dlp se try kar raha hoon...")
         try:
-            # Run yt-dlp --simulate to check if it can extract anything
             sim = await loop.run_in_executor(
                 None,
                 lambda: subprocess.run(
                     ["yt-dlp", "--simulate", "--no-playlist",
-                     "--no-warnings", "--quiet", url],
+                     "--no-warnings", "--quiet", url],   # <-- PAGE URL, not scraped
                     capture_output=True, text=True, timeout=30,
                 )
             )
             if sim.returncode == 0:
-                logger.info(f"[STREAM_PAGE] yt-dlp can handle: {url}")
+                logger.info(f"[STREAM_PAGE] yt-dlp can handle page: {url}")
                 await handle_ytdlp(send_fn, edit, url, tmp_dir)
                 return
-            logger.info(f"[STREAM_PAGE] yt-dlp can't handle ({sim.returncode}), falling back to scrape")
+            logger.info(f"[STREAM_PAGE] yt-dlp can't handle page (rc={sim.returncode}), scraping...")
         except Exception as e:
-            logger.warning(f"[STREAM_PAGE] yt-dlp simulate error: {e}")
+            logger.warning(f"[STREAM_PAGE] yt-dlp simulate failed: {e}")
 
     if cancel.is_set():
         raise asyncio.CancelledError()
 
-    # ── Step 2: fetch page source ─────────────────────────────────────────────
-    await edit("🔍 Scraping page for video links...")
+    # ── Step 2: fetch page HTML ───────────────────────────────────────────────
+    await edit("🔍 Page scrape kar raha hoon...")
     try:
         resp = await loop.run_in_executor(
             None,
-            lambda: HTTP.get(url, timeout=15, allow_redirects=True,
-                             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                                    "Chrome/124.0 Safari/537.36"})
+            lambda: HTTP.get(url, timeout=15, allow_redirects=True, headers=PAGE_HEADERS)
         )
         resp.raise_for_status()
         html = resp.text
     except Exception as e:
-        raise Exception(f"Could not fetch page: {e}")
+        raise Exception(f"Page fetch failed: {e}")
 
     if cancel.is_set():
         raise asyncio.CancelledError()
 
-    # ── Step 3: extract candidate URLs from page ──────────────────────────────
+    # ── Step 3: extract + filter candidates ──────────────────────────────────
     base = f"{urllib.parse.urlparse(url).scheme}://{urllib.parse.urlparse(url).netloc}"
 
     def make_absolute(u: str) -> str:
         u = u.strip().strip('"\'')
-        if u.startswith("//"):
-            return "https:" + u
-        if u.startswith("/"):
-            return base + u
-        if not u.startswith("http"):
-            return url.rstrip("/") + "/" + u
+        if u.startswith("//"):   return "https:" + u
+        if u.startswith("/"):    return base + u
+        if not u.startswith("http"): return url.rstrip("/") + "/" + u
         return u
 
-    candidates: list[tuple[int, str]] = []   # (priority, url)
+    candidates: list[tuple[int, str]] = []   # (priority, url)  lower = better
 
-    # Pattern-based extraction — look in entire HTML/JS source
-    stream_url_re = re.compile(
+    # Priority scheme:
+    #   1 = HLS/DASH stream (.m3u8 / .mpd)
+    #   2 = direct video with explicit key=value assignment in JS/HTML
+    #   3 = direct video found as bare URL (less reliable)
+
+    # Named assignment patterns: src=, file=, url=, stream=, hls=, ...
+    named_re = re.compile(
         r'(?:src|file|url|source|stream|hls|dash|video|media|href)\s*[=:]\s*'
-        r'["\']?(https?://[^\s"\'<>]+?'
+        r'["\']?(https?://[^\s"\'<>{}\[\]]+?'
         r'(?:\.m3u8|\.mpd|\.mp4|\.mkv|\.mov|\.webm|\.avi|\.flv|\.m4v|\.3gp|\.ts)'
-        r'[^\s"\'<>]*)',
+        r'[^\s"\'<>{}\[\]]*)',
         re.IGNORECASE,
     )
-    for m in stream_url_re.finditer(html):
+    for m in named_re.finditer(html):
         u = make_absolute(m.group(1))
-        ext = Path(urllib.parse.urlparse(u).path).suffix.lower()
-        priority = 1 if ext in STREAM_EXTS else 2
-        candidates.append((priority, u))
-        logger.debug(f"[STREAM_PAGE] regex hit: {u}")
+        if is_js_template(u): continue          # ← skip ${videoUrlStr} garbage
+        ext = url_ext(u)
+        pri = 1 if ext in STREAM_EXTS else 2
+        candidates.append((pri, u))
+        logger.debug(f"[STREAM_PAGE] named hit pri={pri}: {u[:100]}")
 
-    # <video src=...> and <source src=...>
-    tag_re = re.compile(
-        r'<(?:video|source)[^>]+src\s*=\s*["\']([^"\']+)["\']',
-        re.IGNORECASE,
-    )
+    # <video src> / <source src> HTML tags
+    tag_re = re.compile(r'<(?:video|source)[^>]+src\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
     for m in tag_re.finditer(html):
         u = make_absolute(m.group(1))
+        if is_js_template(u): continue
         candidates.append((2, u))
-        logger.debug(f"[STREAM_PAGE] tag hit: {u}")
+        logger.debug(f"[STREAM_PAGE] tag hit: {u[:100]}")
 
-    # og:video / og:video:url meta tags
+    # og:video meta
     og_re = re.compile(
-        r'<meta[^>]+(?:property|name)\s*=\s*["\']og:video(?::url)?["\'][^>]+content\s*=\s*["\']([^"\']+)["\']',
+        r'<meta[^>]+(?:property|name)\s*=\s*["\']og:video(?::url)?["\'][^>]+'
+        r'content\s*=\s*["\']([^"\']+)["\']',
         re.IGNORECASE,
     )
     for m in og_re.finditer(html):
         u = make_absolute(m.group(1))
+        if is_js_template(u): continue
         candidates.append((1, u))
-        logger.debug(f"[STREAM_PAGE] og:video hit: {u}")
+        logger.debug(f"[STREAM_PAGE] og:video hit: {u[:100]}")
 
-    # JSON-LD — find contentUrl / embedUrl
-    jsonld_re = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.DOTALL | re.IGNORECASE)
+    # JSON-LD contentUrl / embedUrl
+    jsonld_re = re.compile(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        re.DOTALL | re.IGNORECASE,
+    )
     for m in jsonld_re.finditer(html):
         try:
             import json as _json
@@ -1051,57 +1093,98 @@ async def handle_stream_page(send_fn, edit, url, tmp_dir):
             for key in ("contentUrl", "embedUrl", "url"):
                 val = obj.get(key, "")
                 if val and re.search(r'\.(m3u8|mp4|mpd|mkv|webm)', val, re.IGNORECASE):
-                    candidates.append((1, make_absolute(val)))
-                    logger.debug(f"[STREAM_PAGE] json-ld hit ({key}): {val}")
+                    u = make_absolute(val)
+                    if not is_js_template(u):
+                        candidates.append((1, u))
+                        logger.debug(f"[STREAM_PAGE] json-ld {key}: {u[:100]}")
         except Exception:
             pass
 
-    # Bare URLs anywhere in source (fallback)
+    # Bare URLs in source (lowest priority fallback)
     bare_re = re.compile(
-        r'https?://[^\s"\'<>]+?'
+        r'https?://[^\s"\'<>{}\[\]]+?'
         r'(?:\.m3u8|\.mpd|\.mp4|\.mkv|\.mov|\.webm|\.avi|\.flv|\.m4v|\.3gp|\.ts)'
-        r'(?:[^\s"\'<>]*)?',
+        r'(?:[^\s"\'<>{}\[\]]*)?',
         re.IGNORECASE,
     )
     for m in bare_re.finditer(html):
         u = m.group(0)
-        ext = Path(urllib.parse.urlparse(u).path).suffix.lower()
-        priority = 1 if ext in STREAM_EXTS else 3
-        candidates.append((priority, u))
+        if is_js_template(u): continue
+        ext = url_ext(u)
+        pri = 1 if ext in STREAM_EXTS else 3
+        candidates.append((pri, u))
 
-    if not candidates:
-        raise Exception(
-            "No video URL found on page.\n"
-            "The video may be behind a login, DRM-protected, or loaded via JavaScript.\n"
-            "Try sending the direct video URL instead."
-        )
-
-    # Deduplicate while preserving best priority
+    # Deduplicate — keep best priority per URL
     seen: dict[str, int] = {}
     for pri, u in candidates:
         if u not in seen or pri < seen[u]:
             seen[u] = pri
-    unique = sorted(seen.items(), key=lambda x: x[1])   # lower priority number = better
+    unique = sorted(seen.items(), key=lambda x: x[1])
 
-    logger.info(f"[STREAM_PAGE] Found {len(unique)} unique video URL(s)")
-    for u, p in unique[:5]:
-        logger.info(f"[STREAM_PAGE]   pri={p} url={u[:100]}")
+    logger.info(f"[STREAM_PAGE] {len(unique)} unique candidate(s) after filtering")
+    for u, p in unique[:8]:
+        logger.info(f"[STREAM_PAGE]   pri={p} {u[:120]}")
 
-    best_url, best_pri = unique[0]
-    best_ext = Path(urllib.parse.urlparse(best_url).path).suffix.lower()
-
-    await edit(f"🎯 Video URL mili!\n`{best_url[:80]}{'...' if len(best_url) > 80 else ''}`\n⬇️ Download shuru...")
+    if not unique:
+        raise Exception(
+            "Page mein koi video URL nahi mili.\n"
+            "Video login ke peeche, DRM-protected, ya JS se load ho rahi hai.\n"
+            "Direct video URL (jaise .mp4 / .m3u8) copy karke bhejo."
+        )
 
     if cancel.is_set():
         raise asyncio.CancelledError()
 
-    # ── Step 4: hand off to right handler ────────────────────────────────────
+    # ── Step 4: HEAD-check each candidate, pick first reachable one ──────────
+    await edit(f"🔎 {len(unique)} URL(s) mili — reachability check...")
+
+    best_url: str | None = None
+    best_ext: str        = ""
+
+    def head_ok(u: str) -> bool:
+        """Return True if server responds 2xx/3xx to HEAD with Referer."""
+        try:
+            r = HTTP.head(u, allow_redirects=True, timeout=8,
+                          headers={"User-Agent": PAGE_HEADERS["User-Agent"],
+                                   "Referer": url})
+            logger.info(f"[STREAM_PAGE] HEAD {r.status_code} → {u[:100]}")
+            return r.status_code < 400
+        except Exception as e:
+            logger.info(f"[STREAM_PAGE] HEAD error ({e}) → {u[:100]}")
+            return False
+
+    for u, _pri in unique:
+        ok = await loop.run_in_executor(None, head_ok, u)
+        if ok:
+            best_url = u
+            best_ext = url_ext(u)
+            break
+
+    if not best_url:
+        # Nothing passed HEAD — just try the highest-priority URL anyway
+        best_url, _ = unique[0]
+        best_ext     = url_ext(best_url)
+        logger.warning(f"[STREAM_PAGE] All HEAD checks failed, trying best candidate anyway: {best_url[:100]}")
+
+    await edit(
+        f"🎯 Video URL mili!\n"
+        f"`{best_url[:90]}{'...' if len(best_url) > 90 else ''}`\n"
+        f"⬇️ Download shuru..."
+    )
+
+    if cancel.is_set():
+        raise asyncio.CancelledError()
+
+    # ── Step 5: hand off with Referer header ─────────────────────────────────
     if best_ext in STREAM_EXTS or best_ext == ".ts":
-        # HLS / DASH stream → yt-dlp handles merging segments
-        await handle_ytdlp(send_fn, edit, best_url, tmp_dir)
+        # HLS/DASH → yt-dlp (handles segmented streams, merges to mp4)
+        await handle_ytdlp(send_fn, edit, best_url, tmp_dir,
+                           extra_args=["--add-header", f"Referer:{url}"])
     else:
-        # Direct media file
-        await handle_direct(send_fn, edit, best_url, tmp_dir)
+        # Direct media file — pass Referer so server doesn't 403
+        await handle_direct(send_fn, edit, best_url, tmp_dir,
+                            extra_headers={"Referer": url,
+                                           "User-Agent": PAGE_HEADERS["User-Agent"]})
 
 
 # ═════════════════════════════════════════════════════════════════════════════
