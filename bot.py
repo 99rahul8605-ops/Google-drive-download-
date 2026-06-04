@@ -1663,7 +1663,7 @@ def run_telethon():
     workers = SETTINGS.get("workers", 4)
     bot     = TelegramClient("gdrive_bot_telethon", API_ID, API_HASH)
 
-    async def tl_send(client, chat_id, status_msg, fp, filename=None, file_size=None):
+    async def tl_send(client, chat_id, status_msg, fp, filename=None, file_size=None, thumb=None):
         is_path = isinstance(fp, Path)
         fname   = filename or (fp.name if is_path else "file")
         ext     = Path(fname).suffix.lower()
@@ -1711,6 +1711,15 @@ def run_telethon():
             if not is_path:
                 pass  # already buffered above
 
+            # Extract thumbnail if not provided
+            if not thumb and is_path:
+                try:
+                    thumb = await _aio.get_running_loop().run_in_executor(
+                        None, extract_thumbnail, actual_src, str(fp.parent)
+                    )
+                except Exception:
+                    pass
+
             # Add silent audio track if missing — prevents GIF conversion
             _fixed_tl  = await _aio.get_running_loop().run_in_executor(None, ensure_audio_track, actual_src)
             if _fixed_tl != actual_src:
@@ -1746,12 +1755,16 @@ def run_telethon():
                 attributes=attributes,
                 supports_streaming=ext in VIDEO_EXTS,
                 force_document=ext not in (VIDEO_EXTS | AUDIO_EXTS),
+                thumb=thumb if ext in VIDEO_EXTS else None,
                 part_size_kb=512,
                 progress_callback=progress,
             )
         finally:
             if tmp_vid_tl:
                 try: Path(tmp_vid_tl).unlink()
+                except Exception: pass
+            if thumb:
+                try: Path(thumb).unlink()
                 except Exception: pass
         if is_path:
             try: fp.unlink()
