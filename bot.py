@@ -493,21 +493,68 @@ async def handle_direct(send_fn, edit, url, tmp_dir, disk_only: bool = False,
                     await edit(f"⬇️ **{filename}**\n📥 {human_size(downloaded)}")
             except Exception: pass
         cancelled = [False]
+        MAX_RETRIES = 5
         def _dl_donly():
             downloaded = 0
-            with http_get(url, stream=True, timeout=(10, 300), allow_redirects=True) as r:
-                r.raise_for_status()
-                with open(dest_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                        if cancel.is_set():
-                            cancelled[0] = True
+            for attempt in range(MAX_RETRIES):
+                try:
+                    range_headers = {}
+                    if downloaded > 0:
+                        range_headers["Range"] = f"bytes={downloaded}-"
+                        logger.info(f"[DIRECT/disk] Resuming from {human_size(downloaded)} (attempt {attempt+1}/{MAX_RETRIES})")
+                    with http_get(url, stream=True, timeout=(10, 60),
+                                  allow_redirects=True, headers=range_headers) as r:
+                        # 416 = server doesn't support Range → restart from zero
+                        if r.status_code == 416:
+                            logger.warning("[DIRECT/disk] Range not supported, restarting from 0")
+                            downloaded = 0
+                            if os.path.exists(dest_path):
+                                os.remove(dest_path)
+                            with http_get(url, stream=True, timeout=(10, 60), allow_redirects=True) as r2:
+                                r2.raise_for_status()
+                                with open(dest_path, "wb") as f:
+                                    for chunk in r2.iter_content(chunk_size=4 * 1024 * 1024):
+                                        if cancel.is_set():
+                                            cancelled[0] = True
+                                            return
+                                        if chunk:
+                                            f.write(chunk)
+                                            downloaded += len(chunk)
+                                            asyncio.run_coroutine_threadsafe(_update_donly(downloaded), _donly_loop)
+                            logger.info(f"[DIRECT/disk] Done: {filename} {human_size(downloaded)}")
                             return
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            asyncio.run_coroutine_threadsafe(_update_donly(downloaded), _donly_loop)
-            logger.info(f"[DIRECT/disk] Done: {filename} {human_size(downloaded)}")
-        await loop.run_in_executor(None, _dl_donly)
+                        # Server returned 200 instead of 206 → ignored Range, restart
+                        if downloaded > 0 and r.status_code == 200:
+                            logger.warning("[DIRECT/disk] Server ignored Range header, restarting from 0")
+                            downloaded = 0
+                        r.raise_for_status()
+                        mode = "ab" if downloaded > 0 else "wb"
+                        with open(dest_path, mode) as f:
+                            for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+                                if cancel.is_set():
+                                    cancelled[0] = True
+                                    return
+                                if chunk:
+                                    f.write(chunk)
+                                    downloaded += len(chunk)
+                                    asyncio.run_coroutine_threadsafe(_update_donly(downloaded), _donly_loop)
+                    logger.info(f"[DIRECT/disk] Done: {filename} {human_size(downloaded)}")
+                    return  # success
+                except (requests.exceptions.ChunkedEncodingError,
+                        requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout) as e:
+                    if attempt == MAX_RETRIES - 1:
+                        raise
+                    wait = 2 ** attempt  # 1, 2, 4, 8 seconds
+                    logger.warning(f"[DIRECT/disk] Interrupted at {human_size(downloaded)}, "
+                                   f"retry in {wait}s (attempt {attempt+1}/{MAX_RETRIES}): {e}")
+                    time.sleep(wait)
+        try:
+            await loop.run_in_executor(None, _dl_donly)
+        except Exception:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+            raise
         if cancelled[0]: raise asyncio.CancelledError()
         fp = fix_filename(Path(dest_path))
         if not fp.exists(): raise Exception("Download failed.")
