@@ -86,6 +86,10 @@ _download_lock: asyncio.Lock | None = None
 _cancel_event:  asyncio.Event | None = None
 _active_tmp_dir: str | None = None   # track current download tmp dir for cleanup
 
+# ── DRM session state ─────────────────────────────────────────────────────────
+# drm_sessions[user_id] = {"state": "awaiting_file"|"awaiting_index", "links": [...]}
+drm_sessions: dict[int, dict] = {}
+
 def get_download_lock() -> asyncio.Lock:
     """Always return a Lock tied to the current running event loop."""
     global _download_lock
@@ -1187,6 +1191,110 @@ async def handle_stream_page(send_fn, edit, url, tmp_dir):
                                            "User-Agent": PAGE_HEADERS["User-Agent"]})
 
 
+def extract_thumbnail(video_path: str, out_dir: str) -> str | None:
+    """Extract first frame of video as JPEG thumbnail using ffmpeg.
+    Returns path to thumbnail file, or None if ffmpeg unavailable."""
+    try:
+        thumb_path = os.path.join(out_dir, "thumb.jpg")
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", video_path,
+                "-ss", "00:00:01",          # 1 second in (avoids black frame)
+                "-vframes", "1",
+                "-vf", "scale=320:-1",      # 320px wide thumbnail
+                "-q:v", "3",
+                thumb_path,
+            ],
+            capture_output=True, timeout=30,
+        )
+        if result.returncode == 0 and Path(thumb_path).exists():
+            return thumb_path
+    except Exception as e:
+        logger.warning(f"[THUMB] extract_thumbnail failed: {e}")
+    return None
+
+
+async def handle_drm_download(send_fn_builder, edit_builder, reply_fn,
+                               user_id: int, link: str, tmp_dir: str):
+    """
+    Download a single link from the DRM txt list and send it with thumbnail.
+    send_fn_builder / edit_builder are callables that accept a status_msg
+    and return (send_fn, edit) — needed because we create a fresh status msg here.
+    reply_fn: coroutine that sends a new message and returns it.
+    """
+    status = await reply_fn(f"⏳ Downloading link...")
+    send_fn, edit = send_fn_builder(status), edit_builder(status)
+
+    lock = get_download_lock()
+    if lock.locked():
+        wait_msg = await reply_fn("⏳ Another download in progress. Queued — please wait...")
+        await lock.acquire()
+        try: await wait_msg.delete()
+        except Exception: pass
+    else:
+        await lock.acquire()
+
+    cancel = get_cancel_event()
+    cancel.clear()
+    global _active_tmp_dir
+    _active_tmp_dir = tmp_dir
+
+    try:
+        identifier, link_type = detect_link_type(link)
+        if link_type == "unknown" or not identifier:
+            await edit(f"❌ Invalid link: `{link[:80]}`")
+            return
+
+        logger.info(f"[DRM] user={user_id} type={link_type} url={link[:80]}")
+
+        # Use a wrapper send_fn that attaches thumbnail for video files
+        async def send_with_thumb(fp, **kw):
+            is_path = isinstance(fp, Path)
+            fname   = kw.get("filename") or (fp.name if is_path else "file")
+            ext     = Path(fname).suffix.lower()
+
+            thumb = None
+            if is_path and ext in VIDEO_EXTS:
+                try:
+                    thumb = await asyncio.get_running_loop().run_in_executor(
+                        None, extract_thumbnail, str(fp), tmp_dir
+                    )
+                except Exception:
+                    pass
+
+            if thumb:
+                kw["thumb"] = thumb
+
+            try:
+                await send_fn(fp, **kw)
+            finally:
+                if thumb:
+                    try: Path(thumb).unlink()
+                    except Exception: pass
+
+        if   link_type == "gdrive_folder": await handle_gdrive_folder(send_with_thumb, edit, identifier, tmp_dir)
+        elif link_type == "gdrive_file":   await handle_gdrive_file(send_with_thumb, edit, identifier, tmp_dir)
+        elif link_type == "ytdlp":         await handle_ytdlp(send_with_thumb, edit, identifier, tmp_dir)
+        elif link_type == "direct":        await handle_direct(send_with_thumb, edit, identifier, tmp_dir)
+        elif link_type == "magnet":        await handle_magnet(send_with_thumb, edit, identifier, tmp_dir)
+        elif link_type == "stream_page":   await handle_stream_page(send_with_thumb, edit, identifier, tmp_dir)
+
+    except asyncio.CancelledError:
+        try: await edit("🚫 Download cancelled.")
+        except Exception: pass
+    except Exception as e:
+        logger.error(f"[DRM] Error: {e}", exc_info=True)
+        try: await edit(f"❌ **Error:** {e}")
+        except Exception: pass
+    finally:
+        cancel.clear()
+        _active_tmp_dir = None
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        try: lock.release()
+        except RuntimeError: pass
+        logger.info(f"[DRM] Done | /tmp: {get_tmp_usage()}")
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  PYROGRAM BOT
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1338,7 +1446,60 @@ def run_pyrogram():
             get_cancel_event().set()
             await msg.reply_text("🚫 Cancel signal sent. Download will stop shortly...")
 
-        @bot.on_message(filters.text & ~filters.bot & ~filters.command(["start", "help", "settings", "set", "cancel"]))
+        @bot.on_message(filters.command("drm"))
+        async def drm_cmd(_, msg: Message):
+            uid = msg.from_user.id if msg.from_user else 0
+            drm_sessions[uid] = {"state": "awaiting_file", "links": []}
+            await msg.reply_text(
+                "📄 **DRM Link Downloader**\n\n"
+                "Ek `.txt` file bhejo jisme links hon (ek line = ek link).\n"
+                "Bot links read karke index dikhayega."
+            )
+
+        @bot.on_message(filters.document & ~filters.bot)
+        async def drm_file_handler(_, msg: Message):
+            uid = msg.from_user.id if msg.from_user else 0
+            session = drm_sessions.get(uid)
+            if not session or session.get("state") != "awaiting_file":
+                return   # not in DRM flow, ignore
+
+            fname = msg.document.file_name or ""
+            if not fname.lower().endswith(".txt"):
+                await msg.reply_text("❌ Sirf `.txt` file bhejo.")
+                return
+
+            await msg.reply_text("📥 File read kar raha hoon...")
+            tmp = tempfile.mkdtemp(dir="/tmp")
+            try:
+                dl_path = os.path.join(tmp, fname)
+                await msg.download(file_name=dl_path)
+                text = Path(dl_path).read_text(encoding="utf-8", errors="ignore")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+            links = [l.strip() for l in text.splitlines() if l.strip() and l.strip().startswith("http")]
+            if not links:
+                await msg.reply_text("❌ File mein koi valid HTTP link nahi mila.")
+                drm_sessions.pop(uid, None)
+                return
+
+            drm_sessions[uid] = {"state": "awaiting_index", "links": links}
+
+            # Build numbered list (show max 50 to avoid flood)
+            lines = [f"`{i+1}.` {l[:80]}{'...' if len(l)>80 else ''}" for i, l in enumerate(links[:50])]
+            if len(links) > 50:
+                lines.append(f"... aur {len(links)-50} links")
+            reply = (
+                f"✅ **{len(links)} links mili!**\n\n"
+                + "\n".join(lines)
+                + f"\n\n📥 Konsa index download karna hai? (1–{len(links)})\n"
+                  f"Single `5` → 5 se end tak sab\n"
+                  f"Multiple: `1 3 5` | Range: `2-5`\n"
+                  f"Cancel: `/cancel`"
+            )
+            await msg.reply_text(reply)
+
+        @bot.on_message(filters.text & ~filters.bot & ~filters.command(["start", "help", "settings", "set", "cancel", "drm"]))
         async def handle_message(client, msg: Message):
             if not msg.text:
                 return
@@ -1346,6 +1507,57 @@ def run_pyrogram():
             if msg.date and msg.date.timestamp() < BOT_START_TIME:
                 return
             text = msg.text.strip()
+            uid  = msg.from_user.id if msg.from_user else 0
+
+            # ── DRM index selection ──────────────────────────────────────────
+            session = drm_sessions.get(uid)
+            if session and session.get("state") == "awaiting_index":
+                links   = session["links"]
+                tokens  = text.split()
+                indices = set()
+
+                # Single number → download from that index to end
+                if len(tokens) == 1 and tokens[0].isdigit():
+                    start = int(tokens[0])
+                    indices.update(range(start, len(links) + 1))
+                else:
+                    # Parse "1 3 5" and "2-5" style input
+                    for token in tokens:
+                        if "-" in token:
+                            parts = token.split("-", 1)
+                            try:
+                                a, b = int(parts[0]), int(parts[1])
+                                indices.update(range(a, b + 1))
+                            except ValueError:
+                                pass
+                        else:
+                            try: indices.add(int(token))
+                            except ValueError: pass
+
+                valid = sorted(i for i in indices if 1 <= i <= len(links))
+                if not valid:
+                    await msg.reply_text(
+                        f"❌ Invalid index. 1 se {len(links)} ke beech number bhejo.\n"
+                        f"Example: `1` ya `1 3` ya `2-5`"
+                    )
+                    return
+
+                drm_sessions.pop(uid, None)   # clear session
+
+                for idx in valid:
+                    link    = links[idx - 1]
+                    tmp_dir = tempfile.mkdtemp(dir="/tmp")
+
+                    def _make_send(s): return lambda fp, **kw: pg_send(client, msg, s, fp, **kw)
+                    def _make_edit(s): return lambda t: s.edit_text(t)
+
+                    await handle_drm_download(
+                        _make_send, _make_edit,
+                        lambda t: msg.reply_text(t),
+                        uid, link, tmp_dir,
+                    )
+                return
+            # ── end DRM ──────────────────────────────────────────────────────
             identifier, link_type = detect_link_type(text)
             if link_type == "unknown" or not identifier:
                 await msg.reply_text("❓ Unsupported link. Use /help."); return
@@ -1589,6 +1801,65 @@ def run_telethon():
         get_cancel_event().set()
         await event.reply("🚫 Cancel signal sent. Download will stop shortly...")
 
+    @bot.on(events.NewMessage(pattern="/drm"))
+    async def drm_cmd(event):
+        uid = event.sender_id
+        drm_sessions[uid] = {"state": "awaiting_file", "links": []}
+        await event.reply(
+            "📄 **DRM Link Downloader**\n\n"
+            "Ek `.txt` file bhejo jisme links hon (ek line = ek link).\n"
+            "Bot links read karke index dikhayega."
+        )
+
+    @bot.on(events.NewMessage(func=lambda e: e.message.document is not None))
+    async def drm_file_handler(event):
+        uid = event.sender_id
+        session = drm_sessions.get(uid)
+        if not session or session.get("state") != "awaiting_file":
+            return
+
+        doc   = event.message.document
+        attrs = getattr(doc, "attributes", [])
+        fname = ""
+        for a in attrs:
+            if hasattr(a, "file_name"):
+                fname = a.file_name or ""
+                break
+
+        if not fname.lower().endswith(".txt"):
+            await event.reply("❌ Sirf `.txt` file bhejo.")
+            return
+
+        await event.reply("📥 File read kar raha hoon...")
+        tmp = tempfile.mkdtemp(dir="/tmp")
+        try:
+            dl_path = os.path.join(tmp, fname or "links.txt")
+            await event.message.download_media(file=dl_path)
+            text = Path(dl_path).read_text(encoding="utf-8", errors="ignore")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        links = [l.strip() for l in text.splitlines() if l.strip() and l.strip().startswith("http")]
+        if not links:
+            await event.reply("❌ File mein koi valid HTTP link nahi mila.")
+            drm_sessions.pop(uid, None)
+            return
+
+        drm_sessions[uid] = {"state": "awaiting_index", "links": links}
+
+        lines = [f"`{i+1}.` {l[:80]}{'...' if len(l)>80 else ''}" for i, l in enumerate(links[:50])]
+        if len(links) > 50:
+            lines.append(f"... aur {len(links)-50} links")
+        reply = (
+            f"✅ **{len(links)} links mili!**\n\n"
+            + "\n".join(lines)
+            + f"\n\n📥 Konsa index download karna hai? (1–{len(links)})\n"
+              f"Single `5` → 5 se end tak sab\n"
+              f"Multiple: `1 3 5` | Range: `2-5`\n"
+              f"Cancel: `/cancel`"
+        )
+        await event.reply(reply)
+
     @bot.on(events.NewMessage(func=lambda e: e.is_private or e.is_group))
     async def handle_message(event):
         text = event.raw_text.strip()
@@ -1600,7 +1871,57 @@ def run_telethon():
         sender = await event.get_sender()
         if getattr(sender, "bot", False): return
 
-        identifier, link_type = detect_link_type(text)
+        uid     = event.sender_id
+        chat_id = event.chat_id
+
+        # ── DRM index selection ───────────────────────────────────────────────
+        session = drm_sessions.get(uid)
+        if session and session.get("state") == "awaiting_index":
+            links   = session["links"]
+            tokens  = text.split()
+            indices = set()
+
+            # Single number → download from that index to end
+            if len(tokens) == 1 and tokens[0].isdigit():
+                start = int(tokens[0])
+                indices.update(range(start, len(links) + 1))
+            else:
+                for token in tokens:
+                    if "-" in token:
+                        parts = token.split("-", 1)
+                        try:
+                            a, b = int(parts[0]), int(parts[1])
+                            indices.update(range(a, b + 1))
+                        except ValueError:
+                            pass
+                    else:
+                        try: indices.add(int(token))
+                        except ValueError: pass
+
+            valid = sorted(i for i in indices if 1 <= i <= len(links))
+            if not valid:
+                await event.reply(
+                    f"❌ Invalid index. 1 se {len(links)} ke beech number bhejo.\n"
+                    f"Example: `1` ya `1 3` ya `2-5`"
+                )
+                return
+
+            drm_sessions.pop(uid, None)
+
+            for idx in valid:
+                link    = links[idx - 1]
+                tmp_dir = tempfile.mkdtemp(dir="/tmp")
+
+                def _make_send(s): return lambda fp, **kw: tl_send(bot, chat_id, s, fp, **kw)
+                def _make_edit(s): return lambda t: s.edit(t)
+
+                await handle_drm_download(
+                    _make_send, _make_edit,
+                    lambda t: event.reply(t),
+                    uid, link, tmp_dir,
+                )
+            return
+        # ── end DRM ──────────────────────────────────────────────────────────
         if link_type == "unknown" or not identifier:
             await event.reply("❓ Unsupported link. Use /help."); return
         lock = get_download_lock()
