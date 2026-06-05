@@ -92,24 +92,16 @@ _drm_batch_active: bool = False          # True while a DRM batch loop is runnin
 drm_sessions: dict[int, dict] = {}
 
 def get_download_lock() -> asyncio.Lock:
-    """Always return a Lock tied to the current running event loop."""
+    """Return the single global download Lock. Created once, reused across the session."""
     global _download_lock
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if _download_lock is None or getattr(_download_lock, "_loop", None) is not loop:
+    if _download_lock is None:
         _download_lock = asyncio.Lock()
     return _download_lock
 
 def get_cancel_event() -> asyncio.Event:
-    """Always return a cancel Event tied to the current running event loop."""
+    """Return the single global cancel Event. Created once, reused across the session."""
     global _cancel_event
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if _cancel_event is None or getattr(_cancel_event, "_loop", None) is not loop:
+    if _cancel_event is None:
         _cancel_event = asyncio.Event()
     return _cancel_event
 
@@ -1692,7 +1684,9 @@ def run_pyrogram():
                     tmp_dir = tempfile.mkdtemp(dir="/tmp")
 
                     def _make_send(s): return lambda fp, **kw: pg_send(client, msg, s, fp, **kw)
-                    def _make_edit(s): return lambda t: s.edit_text(t)
+                    def _make_edit(s):
+                        async def _edit(t): await s.edit_text(t)
+                        return _edit
 
                     ok = await handle_drm_download(
                         _make_send, _make_edit,
@@ -1704,6 +1698,14 @@ def run_pyrogram():
                         success_count += 1
                     else:
                         fail_count += 1
+                        # If cancel was triggered during download, stop the batch
+                        if get_cancel_event().is_set():
+                            remaining = total_items - success_count - fail_count
+                            await msg.reply_text(
+                                f"🚫 **Batch cancelled.**\n"
+                                f"✅ Success: {success_count} | ❌ Failed: {fail_count} | ⏭ Skipped: {remaining}"
+                            )
+                            return
 
                  # Completion summary (inside try block)
                  await msg.reply_text(
@@ -2108,7 +2110,9 @@ def run_telethon():
                 tmp_dir = tempfile.mkdtemp(dir="/tmp")
 
                 def _make_send(s): return lambda fp, **kw: tl_send(bot, chat_id, s, fp, **kw)
-                def _make_edit(s): return lambda t: s.edit(t)
+                def _make_edit(s):
+                    async def _edit(t): await s.edit(t)
+                    return _edit
 
                 ok = await handle_drm_download(
                     _make_send, _make_edit,
@@ -2120,6 +2124,14 @@ def run_telethon():
                     success_count += 1
                 else:
                     fail_count += 1
+                    # If cancel was triggered during download, stop the batch
+                    if get_cancel_event().is_set():
+                        remaining = total_items - success_count - fail_count
+                        await event.reply(
+                            f"🚫 **Batch cancelled.**\n"
+                            f"✅ Success: {success_count} | ❌ Failed: {fail_count} | ⏭ Skipped: {remaining}"
+                        )
+                        return
 
              # Completion summary (inside try)
              await event.reply(
