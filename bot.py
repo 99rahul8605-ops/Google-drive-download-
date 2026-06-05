@@ -84,6 +84,7 @@ HTTP.headers.update({"User-Agent": "Mozilla/5.0"})
 BOT_START_TIME   = time.time()   # used to skip stale messages on startup
 _download_lock: asyncio.Lock | None = None
 _cancel_event:  asyncio.Event | None = None
+_drm_stop_after_current: bool = False   # set by /cancel during DRM batch — stops after current item finishes
 _active_tmp_dir: str | None = None   # track current download tmp dir for cleanup
 _drm_batch_active: bool = False          # True while a DRM batch loop is running
 
@@ -1559,13 +1560,18 @@ def run_pyrogram():
 
         @bot.on_message(filters.command("cancel"))
         async def cancel_cmd(_, msg: Message):
-            global _drm_batch_active
+            global _drm_batch_active, _drm_stop_after_current
             lock = get_download_lock()
             if not lock.locked() and not _drm_batch_active:
                 await msg.reply_text("ℹ️ No download is currently running.")
                 return
-            get_cancel_event().set()
-            await msg.reply_text("🚫 Cancel signal sent. Download will stop shortly...")
+            if _drm_batch_active:
+                # DRM batch: let current item finish, then stop
+                _drm_stop_after_current = True
+                await msg.reply_text("🚫 Current download will finish, then batch will stop.")
+            else:
+                get_cancel_event().set()
+                await msg.reply_text("🚫 Cancel signal sent. Download will stop shortly...")
 
         @bot.on_message(filters.command("drm"))
         async def drm_cmd(_, msg: Message):
@@ -1664,20 +1670,22 @@ def run_pyrogram():
                 success_count = 0
                 fail_count    = 0
 
-                # Clear any stale cancel before starting the batch
+                # Reset flags before starting the batch
                 get_cancel_event().clear()
-
-                global _drm_batch_active
-                _drm_batch_active = True
+                global _drm_batch_active, _drm_stop_after_current
+                _drm_batch_active        = True
+                _drm_stop_after_current  = False
+                cancelled_mid_batch      = False
                 try:
                  for idx in valid:
-                    # Stop batch if /cancel was triggered between items
-                    if get_cancel_event().is_set():
+                    # Check if /cancel was sent after the previous item finished
+                    if _drm_stop_after_current:
                         remaining = total_items - success_count - fail_count
                         await msg.reply_text(
-                            f"🚫 **Batch cancelled.**\n"
+                            f"🚫 **Batch stopped after item {idx-1}.**\n"
                             f"✅ Success: {success_count} | ❌ Failed: {fail_count} | ⏭ Skipped: {remaining}"
                         )
+                        cancelled_mid_batch = True
                         break
 
                     link    = links[idx - 1]
@@ -1698,24 +1706,18 @@ def run_pyrogram():
                         success_count += 1
                     else:
                         fail_count += 1
-                        # If cancel was triggered during download, stop the batch
-                        if get_cancel_event().is_set():
-                            remaining = total_items - success_count - fail_count
-                            await msg.reply_text(
-                                f"🚫 **Batch cancelled.**\n"
-                                f"✅ Success: {success_count} | ❌ Failed: {fail_count} | ⏭ Skipped: {remaining}"
-                            )
-                            return
 
-                 # Completion summary (inside try block)
-                 await msg.reply_text(
-                     f"🏁 **Batch complete!**\n\n"
-                     f"✅ Success: `{success_count}`\n"
-                     f"❌ Failed:  `{fail_count}`\n"
-                     f"📦 Total:   `{total_items}`"
-                 )
+                 if not cancelled_mid_batch:
+                  # Completion summary
+                  await msg.reply_text(
+                      f"🏁 **Batch complete!**\n\n"
+                      f"✅ Success: `{success_count}`\n"
+                      f"❌ Failed:  `{fail_count}`\n"
+                      f"📦 Total:   `{total_items}`"
+                  )
                 finally:
-                 _drm_batch_active = False
+                 _drm_batch_active       = False
+                 _drm_stop_after_current = False
                 return
             # ── end DRM ──────────────────────────────────────────────────────
             identifier, link_type = detect_link_type(text)
@@ -1975,13 +1977,18 @@ def run_telethon():
 
     @bot.on(events.NewMessage(pattern="/cancel"))
     async def cancel_cmd(event):
-        global _drm_batch_active
+        global _drm_batch_active, _drm_stop_after_current
         lock = get_download_lock()
         if not lock.locked() and not _drm_batch_active:
             await event.reply("ℹ️ No download is currently running.")
             return
-        get_cancel_event().set()
-        await event.reply("🚫 Cancel signal sent. Download will stop shortly...")
+        if _drm_batch_active:
+            # DRM batch: let current item finish, then stop
+            _drm_stop_after_current = True
+            await event.reply("🚫 Current download will finish, then batch will stop.")
+        else:
+            get_cancel_event().set()
+            await event.reply("🚫 Cancel signal sent. Download will stop shortly...")
 
     @bot.on(events.NewMessage(pattern="/drm"))
     async def drm_cmd(event):
@@ -2090,20 +2097,22 @@ def run_telethon():
             success_count = 0
             fail_count    = 0
 
-            # Clear any stale cancel before starting the batch
+            # Reset flags before starting the batch
             get_cancel_event().clear()
-
-            global _drm_batch_active
-            _drm_batch_active = True
+            global _drm_batch_active, _drm_stop_after_current
+            _drm_batch_active        = True
+            _drm_stop_after_current  = False
+            cancelled_mid_batch      = False
             try:
              for idx in valid:
-                # Stop batch if /cancel was triggered between items
-                if get_cancel_event().is_set():
+                # Check if /cancel was sent after the previous item finished
+                if _drm_stop_after_current:
                     remaining = total_items - success_count - fail_count
                     await event.reply(
-                        f"🚫 **Batch cancelled.**\n"
+                        f"🚫 **Batch stopped after item {idx-1}.**\n"
                         f"✅ Success: {success_count} | ❌ Failed: {fail_count} | ⏭ Skipped: {remaining}"
                     )
+                    cancelled_mid_batch = True
                     break
 
                 link    = links[idx - 1]
@@ -2124,24 +2133,18 @@ def run_telethon():
                     success_count += 1
                 else:
                     fail_count += 1
-                    # If cancel was triggered during download, stop the batch
-                    if get_cancel_event().is_set():
-                        remaining = total_items - success_count - fail_count
-                        await event.reply(
-                            f"🚫 **Batch cancelled.**\n"
-                            f"✅ Success: {success_count} | ❌ Failed: {fail_count} | ⏭ Skipped: {remaining}"
-                        )
-                        return
 
-             # Completion summary (inside try)
-             await event.reply(
-                 f"🏁 **Batch complete!**\n\n"
-                 f"✅ Success: `{success_count}`\n"
-                 f"❌ Failed:  `{fail_count}`\n"
-                 f"📦 Total:   `{total_items}`"
-             )
+             if not cancelled_mid_batch:
+              # Completion summary
+              await event.reply(
+                  f"🏁 **Batch complete!**\n\n"
+                  f"✅ Success: `{success_count}`\n"
+                  f"❌ Failed:  `{fail_count}`\n"
+                  f"📦 Total:   `{total_items}`"
+              )
             finally:
-             _drm_batch_active = False
+             _drm_batch_active       = False
+             _drm_stop_after_current = False
             return
         # ── end DRM ──────────────────────────────────────────────────────────
         if link_type == "unknown" or not identifier:
