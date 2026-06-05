@@ -1288,14 +1288,18 @@ def extract_thumbnail(video_path: str, out_dir: str) -> str | None:
 
 
 async def handle_drm_download(send_fn_builder, edit_builder, reply_fn,
-                               user_id: int, link: str, tmp_dir: str):
+                               user_id: int, link: str, tmp_dir: str,
+                               idx: int = 0, total: int = 0) -> bool:
     """
     Download a single link from the DRM txt list and send it with thumbnail.
     send_fn_builder / edit_builder are callables that accept a status_msg
     and return (send_fn, edit) — needed because we create a fresh status msg here.
     reply_fn: coroutine that sends a new message and returns it.
+    idx / total: 1-based position in the batch (shown in caption).
+    Returns True on success, False on failure/cancel.
     """
-    status = await reply_fn(f"⏳ Downloading link...")
+    index_tag = f"[{idx}/{total}] " if idx and total else ""
+    status = await reply_fn(f"⏳ {index_tag}Downloading link...")
     send_fn, edit = send_fn_builder(status), edit_builder(status)
 
     lock = get_download_lock()
@@ -1307,24 +1311,39 @@ async def handle_drm_download(send_fn_builder, edit_builder, reply_fn,
     else:
         await lock.acquire()
 
+    # NOTE: do NOT call cancel.clear() here — /cancel may have been triggered
+    # between dispatching multiple DRM items; respect it.
     cancel = get_cancel_event()
-    cancel.clear()
     global _active_tmp_dir
     _active_tmp_dir = tmp_dir
 
     try:
+        # Honour a cancel that arrived before we even started this item
+        if cancel.is_set():
+            try: await edit(f"🚫 {index_tag}Cancelled.")
+            except Exception: pass
+            return False
+
         identifier, link_type = detect_link_type(link)
         if link_type == "unknown" or not identifier:
-            await edit(f"❌ Invalid link: `{link[:80]}`")
-            return
+            await edit(f"❌ {index_tag}Invalid link: `{link[:80]}`")
+            return False
 
-        logger.info(f"[DRM] user={user_id} type={link_type} url={link[:80]}")
+        logger.info(f"[DRM] user={user_id} idx={idx}/{total} type={link_type} url={link[:80]}")
 
-        # Use a wrapper send_fn that attaches thumbnail for video files
+        # Wrapper send_fn: injects index tag into caption and attaches thumbnail
         async def send_with_thumb(fp, **kw):
             is_path = isinstance(fp, Path)
             fname   = kw.get("filename") or (fp.name if is_path else "file")
             ext     = Path(fname).suffix.lower()
+
+            # Prepend index to caption so the user can track which file is which
+            if idx and total:
+                existing_caption = kw.get("caption", "")
+                if existing_caption:
+                    kw["caption"] = f"[{idx}/{total}] {existing_caption}"
+                # (if no caption passed, pg_send/tl_send builds it; we'll inject below)
+                kw["_drm_index"] = f"[{idx}/{total}]"   # picked up by send wrappers
 
             thumb = None
             if is_path and ext in VIDEO_EXTS:
@@ -1352,20 +1371,23 @@ async def handle_drm_download(send_fn_builder, edit_builder, reply_fn,
         elif link_type == "gdrive_folder": await handle_gdrive_folder(send_with_thumb, edit, identifier, tmp_dir)
         elif link_type == "magnet":        await handle_magnet(send_with_thumb, edit, identifier, tmp_dir)
 
+        return True   # success
+
     except asyncio.CancelledError:
-        try: await edit("🚫 Download cancelled.")
+        try: await edit(f"🚫 {index_tag}Download cancelled.")
         except Exception: pass
+        return False
     except Exception as e:
         logger.error(f"[DRM] Error: {e}", exc_info=True)
-        try: await edit(f"❌ **Error:** {e}")
+        try: await edit(f"❌ {index_tag}**Error:** {e}")
         except Exception: pass
+        return False
     finally:
-        cancel.clear()
         _active_tmp_dir = None
         shutil.rmtree(tmp_dir, ignore_errors=True)
         try: lock.release()
         except RuntimeError: pass
-        logger.info(f"[DRM] Done | /tmp: {get_tmp_usage()}")
+        logger.info(f"[DRM] Done idx={idx} | /tmp: {get_tmp_usage()}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1404,13 +1426,16 @@ def run_pyrogram():
             except Exception:
                 pass
 
-        async def pg_send(client, message, status_msg, fp, filename=None, file_size=None, thumb=None):
+        async def pg_send(client, message, status_msg, fp, filename=None, file_size=None, thumb=None, **extra):
             # fp can be a Path (disk file) or a file-like object (streaming)
             is_path  = isinstance(fp, Path)
             fname    = filename or (fp.name if is_path else "file")
             ext      = Path(fname).suffix.lower()
             fsize    = fp.stat().st_size if is_path else (file_size or 0)
-            caption  = f"✅ **{fname}**\n📦 {human_size(fsize)}" if fsize else f"✅ **{fname}**"
+            index_prefix = extra.get("_drm_index", "")
+            index_part   = f"{index_prefix} " if index_prefix else ""
+            caption  = (f"{index_part}✅ **{fname}**\n📦 {human_size(fsize)}"
+                        if fsize else f"{index_part}✅ **{fname}**")
             src      = str(fp) if is_path else fp
             kw = dict(
                 chat_id=message.chat.id, file_name=fname, caption=caption,
@@ -1627,18 +1652,47 @@ def run_pyrogram():
 
                 drm_sessions.pop(uid, None)   # clear session
 
+                total_items = len(valid)
+                success_count = 0
+                fail_count    = 0
+
+                # Clear any stale cancel before starting the batch
+                get_cancel_event().clear()
+
                 for idx in valid:
+                    # Stop batch if /cancel was triggered between items
+                    if get_cancel_event().is_set():
+                        remaining = total_items - success_count - fail_count
+                        await msg.reply_text(
+                            f"🚫 **Batch cancelled.**\n"
+                            f"✅ Success: {success_count} | ❌ Failed: {fail_count} | ⏭ Skipped: {remaining}"
+                        )
+                        return
+
                     link    = links[idx - 1]
                     tmp_dir = tempfile.mkdtemp(dir="/tmp")
 
                     def _make_send(s): return lambda fp, **kw: pg_send(client, msg, s, fp, **kw)
                     def _make_edit(s): return lambda t: s.edit_text(t)
 
-                    await handle_drm_download(
+                    ok = await handle_drm_download(
                         _make_send, _make_edit,
                         lambda t: msg.reply_text(t),
                         uid, link, tmp_dir,
+                        idx=idx, total=len(links),
                     )
+                    if ok:
+                        success_count += 1
+                    else:
+                        fail_count += 1
+
+                # Completion summary
+                await msg.reply_text(
+                    f"🏁 **Batch complete!**\n\n"
+                    f"✅ Success: `{success_count}`\n"
+                    f"❌ Failed:  `{fail_count}`\n"
+                    f"📦 Total:   `{total_items}`"
+                )
                 return
             # ── end DRM ──────────────────────────────────────────────────────
             identifier, link_type = detect_link_type(text)
@@ -1745,12 +1799,15 @@ def run_telethon():
     workers = SETTINGS.get("workers", 4)
     bot     = TelegramClient("gdrive_bot_telethon", API_ID, API_HASH)
 
-    async def tl_send(client, chat_id, status_msg, fp, filename=None, file_size=None, thumb=None):
+    async def tl_send(client, chat_id, status_msg, fp, filename=None, file_size=None, thumb=None, **extra):
         is_path = isinstance(fp, Path)
         fname   = filename or (fp.name if is_path else "file")
         ext     = Path(fname).suffix.lower()
         fsize   = fp.stat().st_size if is_path else (file_size or 0)
-        caption = f"✅ **{fname}**\n📦 {human_size(fsize)}" if fsize else f"✅ **{fname}**"
+        index_prefix = extra.get("_drm_index", "")
+        index_part   = f"{index_prefix} " if index_prefix else ""
+        caption = (f"{index_part}✅ **{fname}**\n📦 {human_size(fsize)}"
+                   if fsize else f"{index_part}✅ **{fname}**")
         src     = str(fp) if is_path else fp
         _tl_last = [0.0]
 
@@ -2005,18 +2062,47 @@ def run_telethon():
 
             drm_sessions.pop(uid, None)
 
+            total_items   = len(valid)
+            success_count = 0
+            fail_count    = 0
+
+            # Clear any stale cancel before starting the batch
+            get_cancel_event().clear()
+
             for idx in valid:
+                # Stop batch if /cancel was triggered between items
+                if get_cancel_event().is_set():
+                    remaining = total_items - success_count - fail_count
+                    await event.reply(
+                        f"🚫 **Batch cancelled.**\n"
+                        f"✅ Success: {success_count} | ❌ Failed: {fail_count} | ⏭ Skipped: {remaining}"
+                    )
+                    return
+
                 link    = links[idx - 1]
                 tmp_dir = tempfile.mkdtemp(dir="/tmp")
 
                 def _make_send(s): return lambda fp, **kw: tl_send(bot, chat_id, s, fp, **kw)
                 def _make_edit(s): return lambda t: s.edit(t)
 
-                await handle_drm_download(
+                ok = await handle_drm_download(
                     _make_send, _make_edit,
                     lambda t: event.reply(t),
                     uid, link, tmp_dir,
+                    idx=idx, total=len(links),
                 )
+                if ok:
+                    success_count += 1
+                else:
+                    fail_count += 1
+
+            # Completion summary
+            await event.reply(
+                f"🏁 **Batch complete!**\n\n"
+                f"✅ Success: `{success_count}`\n"
+                f"❌ Failed:  `{fail_count}`\n"
+                f"📦 Total:   `{total_items}`"
+            )
             return
         # ── end DRM ──────────────────────────────────────────────────────────
         if link_type == "unknown" or not identifier:
