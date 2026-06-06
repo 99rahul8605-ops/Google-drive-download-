@@ -709,18 +709,77 @@ async def handle_direct(send_fn, edit, url, tmp_dir, disk_only: bool = False,
     _disk_loop = asyncio.get_running_loop()
     def _dl():
         downloaded = 0
-        with http_get(url, stream=True, timeout=(10, 300), allow_redirects=True) as r:
-            r.raise_for_status()
-            with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                    if cancel.is_set():
-                        cancelled[0] = True
+        server_supports_range = True
+        MAX_RETRIES      = 20
+        MAX_CONSECUTIVE  = 5
+        total_attempts   = 0
+        consecutive_errors = 0
+        while total_attempts < MAX_RETRIES:
+            total_attempts += 1
+            try:
+                range_headers = {}
+                if downloaded > 0 and server_supports_range:
+                    range_headers["Range"] = f"bytes={downloaded}-"
+                    logger.info(f"[DIRECT/disk>2G] Resuming from {human_size(downloaded)} "
+                                f"(attempt {total_attempts}/{MAX_RETRIES}, "
+                                f"consecutive errors: {consecutive_errors})")
+                with http_get(url, stream=True, timeout=(10, 300),
+                              allow_redirects=True, headers=range_headers) as r:
+                    if r.status_code == 416:
+                        logger.warning("[DIRECT/disk>2G] Range not supported, restarting from 0")
+                        server_supports_range = False
+                        downloaded = 0
+                        if os.path.exists(dest_path):
+                            os.remove(dest_path)
+                        with http_get(url, stream=True, timeout=(10, 300), allow_redirects=True) as r2:
+                            r2.raise_for_status()
+                            with open(dest_path, "wb") as f:
+                                for chunk in r2.iter_content(chunk_size=4 * 1024 * 1024):
+                                    if cancel.is_set():
+                                        cancelled[0] = True
+                                        return
+                                    if chunk:
+                                        f.write(chunk)
+                                        downloaded += len(chunk)
+                                        consecutive_errors = 0
+                                        asyncio.run_coroutine_threadsafe(_update_disk_progress(downloaded), _disk_loop)
+                        logger.info(f"[DIRECT/disk>2G] Done: {filename} {human_size(downloaded)}")
                         return
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        asyncio.run_coroutine_threadsafe(_update_disk_progress(downloaded), _disk_loop)
-        logger.info(f"[DIRECT] Disk download complete: {filename} total={human_size(downloaded)}")
+                    if downloaded > 0 and r.status_code == 200:
+                        logger.warning("[DIRECT/disk>2G] Server ignored Range, restarting from 0")
+                        server_supports_range = False
+                        downloaded = 0
+                    r.raise_for_status()
+                    mode = "ab" if downloaded > 0 else "wb"
+                    with open(dest_path, mode) as f:
+                        for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+                            if cancel.is_set():
+                                cancelled[0] = True
+                                return
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                consecutive_errors = 0
+                                asyncio.run_coroutine_threadsafe(_update_disk_progress(downloaded), _disk_loop)
+                logger.info(f"[DIRECT/disk>2G] Done: {filename} total={human_size(downloaded)}")
+                return  # success
+            except (requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as e:
+                consecutive_errors += 1
+                if consecutive_errors >= MAX_CONSECUTIVE:
+                    raise Exception(
+                        f"Gave up after {consecutive_errors} consecutive errors "
+                        f"at {human_size(downloaded)}. Last: {e}"
+                    )
+                if total_attempts >= MAX_RETRIES:
+                    raise
+                wait = min(2 ** consecutive_errors, 30)
+                logger.warning(f"[DIRECT/disk>2G] Interrupted at {human_size(downloaded)}, "
+                               f"retry in {wait}s "
+                               f"(attempt {total_attempts}/{MAX_RETRIES}, "
+                               f"consecutive: {consecutive_errors}/{MAX_CONSECUTIVE}): {e}")
+                time.sleep(wait)
     await loop.run_in_executor(None, _dl)
     if cancelled[0]:
         raise asyncio.CancelledError()
@@ -1374,7 +1433,7 @@ async def handle_drm_download(send_fn_builder, edit_builder, reply_fn,
                     try: Path(thumb).unlink()
                     except Exception: pass
 
-        if   link_type == "direct":        await handle_direct(send_with_thumb, edit, identifier, tmp_dir)
+        if   link_type == "direct":        await handle_direct(send_with_thumb, edit, identifier, tmp_dir, disk_only=True)
         elif link_type == "stream_page":   await handle_stream_page(send_with_thumb, edit, identifier, tmp_dir)
         elif link_type == "ytdlp":         await handle_ytdlp(send_with_thumb, edit, identifier, tmp_dir)
         elif link_type == "gdrive_file":   await handle_gdrive_file(send_with_thumb, edit, identifier, tmp_dir)
