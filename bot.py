@@ -30,9 +30,10 @@ OWNER_ID  = int(os.environ.get("OWNER_ID", "0"))   # apna Telegram user ID daalo
 
 SETTINGS_FILE    = "settings.json"
 DEFAULT_SETTINGS = {
-    "library":   "pyrogram",
-    "workers":   4,
-    "max_dl_gb": 1.95,          # ~2GB safe limit
+    "library":      "pyrogram",
+    "workers":      4,
+    "max_dl_gb":    1.95,          # ~2GB safe limit
+    "watermark":    "",            # floating watermark text (empty = disabled)
 }
 
 def load_settings() -> dict:
@@ -372,7 +373,7 @@ def settings_text() -> str:
         f"`/set library pyrogram` — Switch to Pyrogram\n"
         f"`/set library telethon` — Switch to Telethon\n"
         f"`/set workers 4` — Upload workers (1–8)\n"
-        f"`/set maxdl 1.5` — Max download size in GB\n\n"
+        f"`/set maxdl 1.5` — Max download size in GB\n`/set text Team Secret` — Floating watermark (empty to disable)\n\n"
         f"⚠️ Restart bot after changing library/workers."
     )
 
@@ -425,6 +426,48 @@ async def handle_gdrive_folder(send_fn, edit, folder_id, tmp_dir):
         await edit(f"📤 {i}/{len(all_files)}: **{fp.name}** ({human_size(fp.stat().st_size)})")
         await send_fn(fp)
 
+
+
+def aria2c_download(url: str, dest_path: str, extra_headers: dict | None = None,
+                    connections: int = 16, progress_cb=None, cancel_flag=None) -> None:
+    """Download a file using aria2c with multi-connection for maximum speed.
+    Falls back to single-connection requests if aria2c fails."""
+    import shutil
+    out_dir  = str(Path(dest_path).parent)
+    out_file = Path(dest_path).name
+    cmd = [
+        "aria2c",
+        "--split=" + str(connections),
+        "--max-connection-per-server=" + str(connections),
+        "--min-split-size=1M",
+        "--file-allocation=none",
+        "--allow-overwrite=true",
+        "--auto-file-renaming=false",
+        "--console-log-level=error",
+        "--summary-interval=3",
+        "-d", out_dir,
+        "-o", out_file,
+    ]
+    if extra_headers:
+        for k, v in extra_headers.items():
+            cmd += ["--header", f"{k}: {v}"]
+    cmd.append(url)
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        for line in proc.stdout:
+            if cancel_flag and cancel_flag[0]:
+                proc.terminate()
+                raise asyncio.CancelledError()
+            line = line.strip()
+            if line and progress_cb:
+                progress_cb(line)
+        proc.wait()
+    except Exception:
+        proc.terminate()
+        raise
+    if proc.returncode != 0:
+        raise Exception(f"aria2c failed with code {proc.returncode}")
 
 async def handle_direct(send_fn, edit, url, tmp_dir, disk_only: bool = False,
                         extra_headers: dict | None = None):
@@ -1027,8 +1070,16 @@ async def handle_set_cmd(parts, reply_fn):
         s["max_dl_gb"] = n; save_settings(s)
         await reply_fn(f"✅ Max download set to `{n} GB` (files > 2GB will be split)")
 
+    elif key == "text":
+        wm = " ".join(parts[2:]).strip()   # support multi-word text
+        s["watermark"] = wm; save_settings(s)
+        if wm:
+            await reply_fn(f"✅ Watermark set to: `{wm}`\n📹 Will be applied to all videos.")
+        else:
+            await reply_fn("✅ Watermark disabled.")
+
     else:
-        await reply_fn("❌ Unknown key. Use: `library`, `workers`, `maxdl`")
+        await reply_fn("❌ Unknown key. Use: `library`, `workers`, `maxdl`, `text`")
 
 
 def get_video_meta(filepath: str) -> dict:
@@ -1086,6 +1137,36 @@ def ensure_audio_track(filepath: str) -> str:
         logger.warning(f"[FFMPEG] ensure_audio_track failed: {e}")
     return filepath
 
+
+
+def apply_watermark(filepath: str, text: str) -> str:
+    """Add floating watermark text to video using ffmpeg."""
+    if not text:
+        return filepath
+    try:
+        p        = Path(filepath)
+        out_path = str(p.parent / (p.stem + "_wm" + p.suffix))
+        vf = (
+            "drawtext=text='" + text + "'"
+            ":fontsize=24:fontcolor=white@0.6:borderw=1:bordercolor=black@0.4"
+            ":x='mod(t*60\\,W-text_w)':y='abs(sin(t*0.5))*(H-text_h)'"
+        )
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", filepath, "-vf", vf,
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+             "-c:a", "copy", "-movflags", "+faststart", out_path],
+            capture_output=True, timeout=600,
+        )
+        if result.returncode == 0 and Path(out_path).exists():
+            logger.info(f"[WATERMARK] Applied: {Path(filepath).name}")
+            try: Path(filepath).unlink()
+            except Exception: pass
+            return out_path
+        else:
+            logger.warning(f"[WATERMARK] Failed: {result.stderr.decode()[-200:]}")
+    except Exception as e:
+        logger.warning(f"[WATERMARK] Error: {e}")
+    return filepath
 
 async def handle_stream_page(send_fn, edit, url, tmp_dir):
     """
@@ -1531,6 +1612,11 @@ def run_pyrogram():
                         # Add silent audio track if missing — prevents GIF conversion
                         _fixed = await _loop.run_in_executor(None, ensure_audio_track, str(_disk))
                         _disk  = Path(_fixed)
+                        # Apply watermark if set
+                        _wm_text = load_settings().get("watermark", "")
+                        if _wm_text and str(_disk).lower().endswith((".mp4", ".mkv", ".mov", ".avi", ".webm")):
+                            _wm_out = await _loop.run_in_executor(None, apply_watermark, str(_disk), _wm_text)
+                            _disk = Path(_wm_out)
                         # Extract thumbnail
                         if not thumb:
                             thumb = await _loop.run_in_executor(None, extract_thumbnail, str(_disk), str(_disk.parent))
@@ -1554,6 +1640,10 @@ def run_pyrogram():
                     # Ensure video has an audio track — Telegram converts silent
                     # videos to GIF regardless of file size or metadata.
                     src = await _loop.run_in_executor(None, ensure_audio_track, src)
+                    # Apply watermark if set
+                    _wm_text2 = load_settings().get("watermark", "")
+                    if _wm_text2 and src.lower().endswith((".mp4", ".mkv", ".mov", ".avi", ".webm")):
+                        src = await _loop.run_in_executor(None, apply_watermark, src, _wm_text2)
                     # Extract thumbnail if not provided
                     if not thumb:
                         thumb = await _loop.run_in_executor(None, extract_thumbnail, src, str(Path(src).parent))
@@ -1950,6 +2040,12 @@ def run_telethon():
 
             # Add silent audio track if missing — prevents GIF conversion
             _fixed_tl  = await _aio.get_running_loop().run_in_executor(None, ensure_audio_track, actual_src)
+            # Apply watermark if set
+            _wm_tl = load_settings().get("watermark", "")
+            if _wm_tl and actual_src.lower().endswith((".mp4", ".mkv", ".mov", ".avi", ".webm")):
+                _wm_tl_out = await _aio.get_running_loop().run_in_executor(None, apply_watermark, _fixed_tl, _wm_tl)
+                _fixed_tl = _wm_tl_out
+                actual_src = _fixed_tl
             if _fixed_tl != actual_src:
                 if tmp_vid_tl: 
                     try: Path(tmp_vid_tl).unlink()
