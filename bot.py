@@ -1153,7 +1153,8 @@ def apply_watermark(filepath: str, text: str) -> str:
         )
         result = subprocess.run(
             ["ffmpeg", "-y", "-i", filepath, "-vf", vf,
-             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+             "-b:v", "0", "-maxrate", "2M", "-bufsize", "4M",
              "-c:a", "copy", "-movflags", "+faststart", out_path],
             capture_output=True, timeout=600,
         )
@@ -1582,6 +1583,11 @@ def run_pyrogram():
             fsize    = fp.stat().st_size if is_path else (file_size or 0)
             index_prefix = extra.get("_drm_index", "")
             index_part   = f"{index_prefix} " if index_prefix else ""
+            _wm_tag = load_settings().get("watermark", "")
+            if _wm_tag:
+                _stem = Path(fname).stem
+                _ext  = Path(fname).suffix
+                fname = f"{_stem} {_wm_tag}{_ext}"
             caption  = (f"{index_part}✅ **{fname}**\n📦 {human_size(fsize)}"
                         if fsize else f"{index_part}✅ **{fname}**")
             src      = str(fp) if is_path else fp
@@ -1612,11 +1618,7 @@ def run_pyrogram():
                         # Add silent audio track if missing — prevents GIF conversion
                         _fixed = await _loop.run_in_executor(None, ensure_audio_track, str(_disk))
                         _disk  = Path(_fixed)
-                        # Apply watermark if set
-                        _wm_text = load_settings().get("watermark", "")
-                        if _wm_text and str(_disk).lower().endswith((".mp4", ".mkv", ".mov", ".avi", ".webm")):
-                            _wm_out = await _loop.run_in_executor(None, apply_watermark, str(_disk), _wm_text)
-                            _disk = Path(_wm_out)
+
                         # Extract thumbnail
                         if not thumb:
                             thumb = await _loop.run_in_executor(None, extract_thumbnail, str(_disk), str(_disk.parent))
@@ -1640,10 +1642,7 @@ def run_pyrogram():
                     # Ensure video has an audio track — Telegram converts silent
                     # videos to GIF regardless of file size or metadata.
                     src = await _loop.run_in_executor(None, ensure_audio_track, src)
-                    # Apply watermark if set
-                    _wm_text2 = load_settings().get("watermark", "")
-                    if _wm_text2 and src.lower().endswith((".mp4", ".mkv", ".mov", ".avi", ".webm")):
-                        src = await _loop.run_in_executor(None, apply_watermark, src, _wm_text2)
+
                     # Extract thumbnail if not provided
                     if not thumb:
                         thumb = await _loop.run_in_executor(None, extract_thumbnail, src, str(Path(src).parent))
@@ -1980,6 +1979,11 @@ def run_telethon():
         fsize   = fp.stat().st_size if is_path else (file_size or 0)
         index_prefix = extra.get("_drm_index", "")
         index_part   = f"{index_prefix} " if index_prefix else ""
+        _wm_tag_tl = load_settings().get("watermark", "")
+        if _wm_tag_tl:
+            _stem_tl = Path(fname).stem
+            _ext_tl  = Path(fname).suffix
+            fname = f"{_stem_tl} {_wm_tag_tl}{_ext_tl}"
         caption = (f"{index_part}✅ **{fname}**\n📦 {human_size(fsize)}"
                    if fsize else f"{index_part}✅ **{fname}**")
         src     = str(fp) if is_path else fp
@@ -2040,12 +2044,7 @@ def run_telethon():
 
             # Add silent audio track if missing — prevents GIF conversion
             _fixed_tl  = await _aio.get_running_loop().run_in_executor(None, ensure_audio_track, actual_src)
-            # Apply watermark if set
-            _wm_tl = load_settings().get("watermark", "")
-            if _wm_tl and actual_src.lower().endswith((".mp4", ".mkv", ".mov", ".avi", ".webm")):
-                _wm_tl_out = await _aio.get_running_loop().run_in_executor(None, apply_watermark, _fixed_tl, _wm_tl)
-                _fixed_tl = _wm_tl_out
-                actual_src = _fixed_tl
+
             if _fixed_tl != actual_src:
                 if tmp_vid_tl: 
                     try: Path(tmp_vid_tl).unlink()
