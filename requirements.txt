@@ -6,3 +6,4 @@ telethon
 yt-dlp
 aiohttp
 flask
+Aria2c
