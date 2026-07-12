@@ -392,7 +392,7 @@ async def handle_gdrive_file(send_fn, edit, file_id, tmp_dir):
     downloaded = await loop.run_in_executor(
         None, lambda: gdown.download(
             f"https://drive.google.com/uc?id={file_id}&export=download",
-            output=tmp_dir + "/", quiet=False, fuzzy=True
+            output=tmp_dir + "/", quiet=False
         )
     )
     if get_cancel_event().is_set(): raise asyncio.CancelledError()
@@ -416,7 +416,7 @@ async def handle_gdrive_folder(send_fn, edit, folder_id, tmp_dir):
     await loop.run_in_executor(
         None, lambda: gdown.download_folder(
             f"https://drive.google.com/drive/folders/{folder_id}",
-            output=folder_dir, quiet=True, remaining_ok=True
+            output=folder_dir, quiet=True
         )
     )
     all_files = sorted([f for f in Path(folder_dir).rglob("*") if f.is_file()], key=lambda f: f.name.lower())
@@ -1591,6 +1591,16 @@ async def handle_drm_download(send_fn_builder, edit_builder, reply_fn,
 
 def run_pyrogram():
     import signal
+
+    # Pyrogram's sync.py calls asyncio.get_event_loop() at import time.
+    # Python 3.10+ (and especially 3.12/3.14) no longer auto-creates a loop
+    # when none exists in the current thread, which raises RuntimeError
+    # before pyrogram even finishes importing. Create one manually first.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     from pyrogram import Client, filters
     from pyrogram.types import Message
 
