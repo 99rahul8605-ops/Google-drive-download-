@@ -1468,9 +1468,72 @@ def extract_thumbnail(video_path: str, out_dir: str) -> str | None:
     return None
 
 
+
+def parse_drm_txt(text: str) -> list[dict]:
+    """Parse TXT entries while preserving a lecture/title line before each URL.
+
+    Supported examples:
+      1. Lecture Name\nhttps://.../video.mp4
+      Lecture Name\nhttps://.../video.mp4
+      Lecture Name | https://.../video.mp4
+      https://.../video.mp4
+    """
+    items = []
+    pending_title = None
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        # Find an HTTP(S) URL anywhere on the line.
+        m = re.search(r'https?://\\S+', line)
+        if m:
+            url = m.group(0).rstrip('),]}>.,;')
+            inline_title = line[:m.start()].strip(' \t|-:')
+            title = inline_title or pending_title
+            if title:
+                # Remove common numbering prefixes: "1. ", "2) ", "[3] " etc.
+                title = re.sub(r'^\\s*(?:\\[?\\d+\\]?)[.)\\-:]?\\s*', '', title).strip()
+            items.append({"url": url, "name": title or None})
+            pending_title = None
+        else:
+            # Keep the latest non-URL line as the title for the next URL.
+            pending_title = line
+
+    return items
+
+
+def make_preferred_filename(title: str | None, actual_name: str) -> str | None:
+    """Build a safe filename using TXT title while preserving the real extension."""
+    if not title:
+        return None
+
+    title = re.sub(r'[\\/\\:*?"<>|\\x00-\\x1f]', '_', title).strip().strip('.')
+    title = re.sub(r'\\s+', ' ', title)
+    if not title:
+        return None
+
+    actual_ext = Path(actual_name).suffix
+    title_ext = Path(title).suffix
+
+    # If TXT title has no useful extension, keep the downloaded video's extension.
+    if not title_ext and actual_ext:
+        title += actual_ext
+
+    # Keep Telegram/filesystem names reasonable.
+    if len(title) > 180:
+        ext = Path(title).suffix
+        stem = Path(title).stem[: max(1, 180 - len(ext))]
+        title = stem + ext
+
+    return title
+
+
 async def handle_drm_download(send_fn_builder, edit_builder, reply_fn,
                                user_id: int, link: str, tmp_dir: str,
-                               idx: int = 0, total: int = 0) -> bool:
+                               idx: int = 0, total: int = 0,
+                               preferred_name: str | None = None) -> bool:
     """
     Download a single link from the DRM txt list and send it with thumbnail.
     send_fn_builder / edit_builder are callables that accept a status_msg
@@ -1531,6 +1594,27 @@ async def handle_drm_download(send_fn_builder, edit_builder, reply_fn,
         # Wrapper send_fn: injects index tag into caption and attaches thumbnail
         async def send_with_thumb(fp, **kw):
             is_path = isinstance(fp, Path)
+
+            # For TXT batch downloads, prefer the lecture/title written in the TXT
+            # instead of the generic remote name (often just video.mp4).
+            actual_name = kw.get("filename") or (fp.name if is_path else "file")
+            wanted_name = make_preferred_filename(preferred_name, actual_name)
+
+            if wanted_name:
+                kw["filename"] = wanted_name
+                if is_path and fp.name != wanted_name:
+                    new_fp = fp.parent / wanted_name
+                    # Avoid accidental overwrite if two lectures have the same title.
+                    if new_fp.exists() and new_fp != fp:
+                        stem, ext0 = new_fp.stem, new_fp.suffix
+                        n = 2
+                        while new_fp.exists():
+                            new_fp = fp.parent / f"{stem} ({n}){ext0}"
+                            n += 1
+                    fp.rename(new_fp)
+                    fp = new_fp
+                    kw["filename"] = fp.name
+
             fname   = kw.get("filename") or (fp.name if is_path else "file")
             ext     = Path(fname).suffix.lower()
 
@@ -1808,7 +1892,7 @@ def run_pyrogram():
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
 
-            links = [l.strip() for l in text.splitlines() if l.strip() and l.strip().startswith("http")]
+            links = parse_drm_txt(text)
             if not links:
                 await msg.reply_text("❌ File mein koi valid HTTP link nahi mila.")
                 drm_sessions.pop(uid, None)
@@ -1892,7 +1976,13 @@ def run_pyrogram():
                         cancelled_mid_batch = True
                         break
 
-                    link    = links[idx - 1]
+                    item = links[idx - 1]
+                    if isinstance(item, dict):
+                        link = item.get("url", "")
+                        preferred_name = item.get("name")
+                    else:
+                        link = item
+                        preferred_name = None
                     tmp_dir = tempfile.mkdtemp(dir="/tmp")
 
                     def _make_send(s): return lambda fp, **kw: pg_send(client, msg, s, fp, **kw)
@@ -1905,6 +1995,7 @@ def run_pyrogram():
                         lambda t: msg.reply_text(t),
                         uid, link, tmp_dir,
                         idx=idx, total=len(links),
+                        preferred_name=preferred_name,
                     )
                     if ok:
                         success_count += 1
@@ -2238,7 +2329,7 @@ def run_telethon():
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-        links = [l.strip() for l in text.splitlines() if l.strip() and l.strip().startswith("http")]
+        links = parse_drm_txt(text)
         if not links:
             await event.reply("❌ File mein koi valid HTTP link nahi mila.")
             drm_sessions.pop(uid, None)
@@ -2325,7 +2416,13 @@ def run_telethon():
                     cancelled_mid_batch = True
                     break
 
-                link    = links[idx - 1]
+                item = links[idx - 1]
+                if isinstance(item, dict):
+                    link = item.get("url", "")
+                    preferred_name = item.get("name")
+                else:
+                    link = item
+                    preferred_name = None
                 tmp_dir = tempfile.mkdtemp(dir="/tmp")
 
                 def _make_send(s): return lambda fp, **kw: tl_send(bot, chat_id, s, fp, **kw)
@@ -2338,6 +2435,7 @@ def run_telethon():
                     lambda t: event.reply(t),
                     uid, link, tmp_dir,
                     idx=idx, total=len(links),
+                    preferred_name=preferred_name,
                 )
                 if ok:
                     success_count += 1
