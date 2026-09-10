@@ -1487,14 +1487,14 @@ def parse_drm_txt(text: str) -> list[dict]:
             continue
 
         # Find an HTTP(S) URL anywhere on the line.
-        m = re.search(r'https?://\\S+', line)
+        m = re.search(r'https?://\S+', line)
         if m:
             url = m.group(0).rstrip('),]}>.,;')
             inline_title = line[:m.start()].strip(' \t|-:')
             title = inline_title or pending_title
             if title:
                 # Remove common numbering prefixes: "1. ", "2) ", "[3] " etc.
-                title = re.sub(r'^\\s*(?:\\[?\\d+\\]?)[.)\\-:]?\\s*', '', title).strip()
+                title = re.sub(r'^\s*(?:\[?\d+\]?)[.)\-:]?\s*', '', title).strip()
             items.append({"url": url, "name": title or None})
             pending_title = None
         else:
@@ -1509,8 +1509,8 @@ def make_preferred_filename(title: str | None, actual_name: str) -> str | None:
     if not title:
         return None
 
-    title = re.sub(r'[\\/\\:*?"<>|\\x00-\\x1f]', '_', title).strip().strip('.')
-    title = re.sub(r'\\s+', ' ', title)
+    title = re.sub(r'[\/\:*?"<>|\x00-\x1f]', '_', title).strip().strip('.')
+    title = re.sub(r'\s+', ' ', title)
     if not title:
         return None
 
