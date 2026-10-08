@@ -81,6 +81,12 @@ MAGNET_PATTERN = re.compile(r"magnet:\?xt=urn:[a-zA-Z0-9]+:[a-fA-F0-9]{32,40}", 
 STREAM_EXTS    = {".m3u8", ".m3u", ".mpd", ".f4m"}
 VIDEO_EXTS     = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v", ".3gp"}
 AUDIO_EXTS     = {".mp3", ".m4a", ".ogg", ".flac", ".wav", ".aac", ".opus"}
+KNOWN_FILE_EXTS = VIDEO_EXTS | AUDIO_EXTS | STREAM_EXTS | {
+    ".pdf", ".zip", ".rar", ".7z", ".tar", ".gz",
+    ".jpg", ".jpeg", ".png", ".gif", ".webp",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".txt", ".csv", ".json",
+}
 
 HTTP             = requests.Session()
 HTTP.headers.update({"User-Agent": "Mozilla/5.0"})
@@ -170,19 +176,37 @@ def get_real_filename(file_id):
         logger.warning(f"GDrive filename failed: {e}")
     return None
 
+def _name_with_real_extension(name: str, content_type: str = "") -> str:
+    """Keep dotted dates/numbers in names, but do not mistake them for file extensions."""
+    name = (name or "").strip()
+    real_ext = content_type_to_ext(content_type)
+    suffix = Path(name).suffix.lower() if name else ""
+
+    # A suffix such as `.78` / `.2026` is part of the title, not a file type.
+    # If the server tells us the actual MIME type, append its real extension.
+    if name and real_ext and suffix not in KNOWN_FILE_EXTS:
+        return name + real_ext
+    return name
+
 def get_direct_filename(url: str) -> str:
     try:
         resp = HTTP.head(url, allow_redirects=True, timeout=10)
+        content_type = resp.headers.get("Content-Type", "")
         cd   = resp.headers.get("Content-Disposition", "")
         m    = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\n]+)', cd, re.IGNORECASE)
         if m:
             name = urllib.parse.unquote(m.group(1).strip().strip('"\''))
-            if name: return name
+            if name:
+                return _name_with_real_extension(name, content_type)
         path = urllib.parse.urlparse(url).path
         name = urllib.parse.unquote(path.rstrip("/").split("/")[-1])
-        if name and "." in name: return name
-        ext = content_type_to_ext(resp.headers.get("Content-Type", ""))
-        return f"file{ext}" if ext else "downloaded_file"
+        if name:
+            fixed = _name_with_real_extension(name, content_type)
+            suffix = Path(fixed).suffix.lower()
+            if suffix in KNOWN_FILE_EXTS:
+                return fixed
+        ext = content_type_to_ext(content_type)
+        return f"file{ext}" if ext else (name or "downloaded_file")
     except Exception:
         pass
     name = urllib.parse.unquote(urllib.parse.urlparse(url).path.rstrip("/").split("/")[-1])
@@ -215,12 +239,17 @@ def sniff_extension(filepath):
         b"%PDF": ".pdf", b"\x89PNG": ".png", b"\xff\xd8\xff": ".jpg",
         b"GIF8": ".gif", b"PK\x03\x04": ".zip", b"Rar!": ".rar",
         b"\x1f\x8b": ".gz", b"ID3": ".mp3", b"fLaC": ".flac",
+        b"\x1aE\xdf\xa3": ".mkv",
     }
     try:
         with open(filepath, "rb") as f:
-            h = f.read(8)
+            h = f.read(16)
         for magic, ext in sigs.items():
             if h.startswith(magic): return ext
+        if len(h) >= 8 and h[4:8] == b"ftyp":
+            return ".mp4"
+        if len(h) >= 12 and h.startswith(b"RIFF") and h[8:12] == b"AVI ":
+            return ".avi"
     except Exception:
         pass
     return ""
@@ -244,7 +273,10 @@ def upload_bar(current: int, total: int) -> str:
     return f"{bar} {pct}%\n📤 {human_size(current)} / {human_size(total)}"
 
 def fix_filename(fp: Path) -> Path:
-    if "." not in fp.name:
+    suffix = fp.suffix.lower()
+    # Unknown suffixes like `.78` are often dotted dates/numbers in captions.
+    # Sniff the downloaded bytes and append the real type instead.
+    if suffix not in KNOWN_FILE_EXTS:
         ext = sniff_extension(str(fp))
         if ext:
             new = fp.parent / (fp.name + ext)
@@ -1517,9 +1549,15 @@ def make_preferred_filename(title: str | None, actual_name: str) -> str | None:
     actual_ext = Path(actual_name).suffix
     title_ext = Path(title).suffix
 
-    # If TXT title has no useful extension, keep the downloaded video's extension.
-    if not title_ext and actual_ext:
-        title += actual_ext
+    # The downloaded file type is authoritative. A dotted number/date such as
+    # `05.78` is caption text, not an extension, so preserve it and append .mp4/.pdf.
+    if actual_ext:
+        if title_ext.lower() == actual_ext.lower():
+            pass
+        elif title_ext.lower() in KNOWN_FILE_EXTS:
+            title = title[:-len(title_ext)] + actual_ext
+        else:
+            title += actual_ext
 
     # Keep Telegram/filesystem names reasonable.
     if len(title) > 180:
